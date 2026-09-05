@@ -92,6 +92,7 @@ Before writing any config, settle this, because everything else is downstream:
 | --- | --- | --- |
 | Postgres **server** | ✅ one container | |
 | Postgres **database** | | ✅ one per checkout |
+| Postgres **test database** | | ✅ one per checkout |
 | Redis **server** | ✅ one container | |
 | Redis **keyspace** | | ✅ one prefix per checkout |
 | Mailpit | ✅ one inbox | |
@@ -349,6 +350,59 @@ docker ps --format '{{.Names}}'                                  # 5 containers,
 
 Five containers: two apps, one Postgres, one Redis, one Mailpit.
 
+### Its own test database
+
+The development database is only half of it. `RefreshDatabase` migrates and
+truncates, so two checkouts running tests against one database destroy each
+other's runs — this is the case where sharing genuinely corrupts data.
+
+You cannot fix it in `phpunit.xml`, for two reasons. It is tracked, so it is the
+same file in every worktree. And its `<env>` entries are pushed into the process
+environment before Laravel boots, while Laravel's dotenv is immutable and never
+overwrites a variable that is already set — so whatever `phpunit.xml` names wins
+over any `.env` file you write.
+
+The way through is to have `phpunit.xml` name no database, and put the name in
+`.env.testing`. Laravel loads `.env.<APP_ENV>` *instead of* `.env`, and
+`phpunit.xml` already sets `APP_ENV=testing`, so that file is the entire
+environment a test run sees — which is why it is generated as a copy of `.env`
+with only `DB_DATABASE` swapped, rather than written from scratch.
+
+Delete this line from `phpunit.xml`:
+
+```xml
+<env name="DB_DATABASE" value="testing"/>
+```
+
+add `.env.testing` to `.gitignore` beside `.env`, and generate one per checkout:
+
+```dotenv
+DB_DATABASE=laravel_feature_x_testing
+```
+
+The main checkout needs one too; it can keep the `testing` database Sail's init
+script already creates.
+
+That trade has a sharp edge worth closing. Without `.env.testing`, Laravel falls
+back to `.env` and the suite runs against the checkout's *development* database,
+which `RefreshDatabase` then wipes. Put a guard in `tests/TestCase.php`:
+
+```php
+protected function setUp(): void
+{
+    parent::setUp();
+
+    $database = DB::connection()->getDatabaseName();
+
+    if ($database !== ':memory:' && ! str_ends_with($database, 'testing')) {
+        $this->fail("Refusing to run tests against the database [{$database}].");
+    }
+}
+```
+
+Check it by pointing `.env.testing` at the development database on purpose and
+confirming the suite refuses.
+
 ### Migrate before you probe
 
 Laravel's default `SESSION_DRIVER=database` means *every* request needs the
@@ -522,5 +576,7 @@ container, so using it makes every checkout call itself "html".
 | `--directory` collapses untracked dirs | `.worktreeinclude` pattern never matches | match the directory (`/bin/`), not a file in it |
 | `base_path()` in a container | every checkout is called "html" | `IGNITION_LOCAL_SITES_PATH` |
 | Docker credential helper hangs | pulls stall on `error getting credentials` | restart Docker Desktop, or drop `credsStore` |
+| `phpunit.xml` is tracked | every checkout tests against one shared database | name the database in `.env.testing`, not `phpunit.xml` |
+| PHPUnit `<env>` beats dotenv | `.env.testing` silently ignored | remove the entry from `phpunit.xml`; it cannot be overridden |
 | Claude Code removed the worktree itself | container and database orphaned | `worktree-sail teardown <path>`; a `WorktreeRemove` hook will not do it |
 | Hooks in project `.claude/settings.json` | never run in a fresh session | put them in `~/.claude/settings.json`, which is trusted |

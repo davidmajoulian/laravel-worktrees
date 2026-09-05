@@ -42,8 +42,9 @@ Run these from anywhere inside the checkout you mean.
 | --- | --- |
 | `bin/worktree-sail create <branch> [base]` | worktree + dependencies + config + database + container + migrations |
 | `bin/worktree-sail up` | configure and start the current worktree (idempotent) |
-| `bin/worktree-sail prepare` | config + shared services + database, but no container |
+| `bin/worktree-sail prepare` | config + shared services + both databases, but no container |
 | `bin/worktree-sail init` | rewrite `.env` only; touches no containers |
+| `bin/worktree-sail testing-env` | (re)write `.env.testing`; works in the main checkout too |
 | `bin/worktree-sail status` | every checkout, its port, state and database |
 | `bin/worktree-sail down` | stop and remove this worktree's container |
 | `bin/worktree-sail destroy` | …plus its networks, volumes, database and cache keys |
@@ -131,6 +132,7 @@ The main checkout's project name is pinned in its `.env`
 | `APP_PORT` / `VITE_PORT` | separates the published ports | `8001` / `5174` |
 | `APP_URL` | matches the port | `http://localhost:8001` |
 | `DB_DATABASE` | own database on the shared server | `laravel_feature_x` |
+| `DB_DATABASE` in `.env.testing` | own **test** database | `laravel_feature_x_testing` |
 | `REDIS_PREFIX` / `CACHE_PREFIX` | own key namespace on the shared Redis | `feature_x_database_` |
 
 Docker Compose reads `COMPOSE_PROJECT_NAME` from `.env` itself, and
@@ -196,7 +198,7 @@ files. The shim closes that window.
 `remove` deletes everything a worktree created and nothing else:
 
 - containers, networks and volumes carrying its Compose project label
-- its database on the shared Postgres
+- both of its databases on the shared Postgres, development and test
 - its Redis and cache keys, by prefix
 - the worktree directory, and its branch with `--branch`
 
@@ -253,6 +255,41 @@ One incidental finding from that test: hooks in a project's
 hooks in `~/.claude/settings.json` did. Project-scoped hooks need the workspace
 trust or approval that a scripted session never grants — worth remembering when
 a project hook seems to do nothing.
+
+## Tests get their own database too
+
+Tests are the case where sharing a database actually corrupts something:
+`RefreshDatabase` migrates and truncates, so two checkouts running suites at once
+would tear each other's data out mid-run.
+
+They cannot be separated the way the development database is, because
+`phpunit.xml` is **tracked** — it is identical in every worktree, so it cannot
+name a different database in each one. And it cannot simply be overridden: a
+`<env>` entry in `phpunit.xml` is put into the process environment before Laravel
+boots, and Laravel's dotenv is immutable, so it never overwrites a variable that
+is already set. Whatever `phpunit.xml` names, wins.
+
+So `phpunit.xml` names no database at all, and the name comes from
+**`.env.testing`**, which Laravel loads *instead of* `.env` when `APP_ENV` is set
+— and `phpunit.xml` sets `APP_ENV=testing`. That makes it per-checkout state, like
+`.env`, and it is git-ignored for the same reason.
+
+| Checkout | Development | Test |
+| --- | --- | --- |
+| main | `laravel` | `testing` |
+| `feature-x` | `laravel_feature_x` | `laravel_feature_x_testing` |
+
+`worktree-sail init` writes `.env.testing` as a copy of the checkout's `.env` with
+only the database swapped, so it stays in step with the app key, ports and service
+hosts. `prepare` creates the database; teardown drops it. The main checkout needs
+the file too — run `bin/worktree-sail testing-env` there once; it reuses the
+`testing` database Sail's own init script already creates.
+
+Because `.env.testing` carries the whole environment, a missing one is dangerous:
+Laravel falls back to `.env` and the suite would run against that checkout's
+*development* database, which `RefreshDatabase` would wipe. `Tests\TestCase`
+refuses to run when the database name does not end in `testing`, and says how to
+fix it.
 
 ## Verifying it
 
