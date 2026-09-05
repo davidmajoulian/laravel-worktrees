@@ -1,0 +1,23 @@
+# Files that git ignores but that a new worktree still needs in order to boot a
+# working Sail environment. Claude Code matches these .gitignore-style patterns
+# against `git ls-files --others --ignored --exclude-standard --directory` and
+# copies whatever matches into the new worktree; `bin/worktree-sail create` runs
+# the same query itself, so both routes produce the same result.
+#
+# The isolation tooling itself (bin/worktree-sail, compose.worktree.yaml) is
+# tracked, so git already puts it in every worktree -- it does not belong here.
+
+# Environment file. Copied verbatim from the main checkout, then rewritten with
+# this worktree's own ports / database / prefixes by `bin/worktree-sail init`.
+.env
+
+# PHP and JS dependencies. The app container bind-mounts the worktree at
+# /var/www/html, so these have to exist inside it. Copying is far quicker than
+# a `composer install` + `npm install` on every new branch, and on APFS `cp -c`
+# clones them, so it costs neither time nor disk space.
+/vendor/
+/node_modules/
+
+# Pre-built front-end assets, so the worktree renders immediately without
+# having to run `npm run build` or the Vite dev server first.
+/public/build/
