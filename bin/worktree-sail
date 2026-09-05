@@ -1,0 +1,548 @@
+#!/usr/bin/env bash
+#
+# worktree-sail -- give every git worktree its own Laravel Sail application
+# container, while reusing one shared set of backing services.
+#
+#   main checkout          compose.yaml           laravel.test + pgsql + redis + mailpit
+#   .claude/worktrees/<x>  compose.worktree.yaml  laravel.test only, attached to the
+#                                                 main project's "sail" network
+#
+# Isolated per worktree : app container, APP_PORT, VITE_PORT, Compose project,
+#                         Postgres database, Redis/cache key prefix.
+# Shared by all of them  : the Postgres, Redis and Mailpit containers.
+#
+# Everything is driven by variables written into the worktree's .env. The
+# Sail-generated compose.yaml is never modified, and nothing this script
+# generates per worktree -- the rewritten .env, the worktree directory itself --
+# is tracked by git. Only the tooling is, so `git worktree add` alone is enough
+# to give a new worktree this script and compose.worktree.yaml.
+#
+# Usage, from anywhere inside a worktree:
+#   worktree-sail up                  configure this worktree, then start it
+#   worktree-sail init                write .env only, touch no containers
+#   worktree-sail down                stop and remove this worktree's container
+#   worktree-sail destroy             ... plus its network, volumes, database and cache
+#   worktree-sail status              list every worktree, its ports and state
+#
+# And from anywhere in the repository:
+#   worktree-sail create <branch> [base]   git worktree add + copy + up
+#   worktree-sail remove <name> [--branch] destroy everything, then drop the worktree
+
+set -euo pipefail
+
+APP_PORT_BASE=8001
+VITE_PORT_BASE=5174
+SHARED_SERVICES="pgsql redis mailpit"
+
+if [ -t 1 ]; then
+    BOLD=$(tput bold 2>/dev/null || true); RED=$(tput setaf 1 2>/dev/null || true)
+    GREEN=$(tput setaf 2 2>/dev/null || true); YELLOW=$(tput setaf 3 2>/dev/null || true)
+    NC=$(tput sgr0 2>/dev/null || true)
+else
+    BOLD=""; RED=""; GREEN=""; YELLOW=""; NC=""
+fi
+
+info() { printf '%s==>%s %s\n' "$GREEN" "$NC" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$YELLOW" "$NC" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
+
+# --- locate the main checkout and the current worktree ----------------------
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "not inside a git repository"
+
+WORKTREE_ROOT=$(cd "$(git rev-parse --show-toplevel)" && pwd -P)
+cd "$WORKTREE_ROOT"
+
+COMMON_DIR=$(git rev-parse --git-common-dir)
+case "$COMMON_DIR" in
+    /*) ;;
+    *)  COMMON_DIR="$WORKTREE_ROOT/$COMMON_DIR" ;;
+esac
+MAIN_ROOT=$(cd "$(dirname "$COMMON_DIR")" && pwd -P)
+
+ENV_FILE="$WORKTREE_ROOT/.env"
+MAIN_ENV="$MAIN_ROOT/.env"
+
+# --- .env helpers -----------------------------------------------------------
+
+env_get() { # <file> <key>
+    local file=$1 key=$2 line
+    [ -f "$file" ] || return 1
+    line=$(grep -m1 "^${key}=" "$file" 2>/dev/null) || return 1
+    line=${line#*=}
+    line=${line%\"}
+    line=${line#\"}
+    printf '%s' "$line"
+}
+
+env_or() { # <file> <key> <fallback>
+    local v
+    if v=$(env_get "$1" "$2") && [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "$3"; fi
+}
+
+env_set() { # <file> <key> <value>
+    local file=$1 key=$2 value=$3 tmp
+    tmp="${file}.worktree-sail.$$"
+    if grep -q "^${key}=" "$file" 2>/dev/null; then
+        awk -v k="$key" -v v="$value" '
+            index($0, k "=") == 1 && !done { print k "=" v; done = 1; next }
+            { print }
+        ' "$file" > "$tmp"
+    else
+        cat "$file" > "$tmp"
+        printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    fi
+    mv "$tmp" "$file"
+}
+
+slugify() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+        | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//'
+}
+
+detect_main_project() {
+    local n
+    n=$(env_or "$MAIN_ENV" COMPOSE_PROJECT_NAME "")
+    [ -n "$n" ] || n=$(slugify "$(basename "$MAIN_ROOT")")
+    printf '%s' "$n"
+}
+
+worktree_project() { # <worktree path>
+    printf '%s-%s' "$(detect_main_project)" "$(slugify "$(basename "$1")")"
+}
+
+# True only when this worktree's .env has actually been rewritten to describe its
+# own isolated stack. Until then the .env is still a verbatim copy of the main
+# checkout's, naming the main project and the stock compose.yaml -- running
+# `sail down --volumes` against it would delete the main checkout's containers
+# and data volumes.
+worktree_is_configured() { # <worktree path>
+    local env=$1/.env
+    [ -f "$env" ] || return 1
+    [ "$(env_or "$env" SAIL_FILES "")" = "compose.worktree.yaml" ] || return 1
+    [ "$(env_or "$env" COMPOSE_PROJECT_NAME "")" != "$(detect_main_project)" ] || return 1
+    return 0
+}
+
+# The Compose project a worktree owns. A worktree whose .env was copied but never
+# rewritten still names the *main* project, which must never be treated as its
+# own, so fall back to the derived name in that case.
+resolve_project() { # <worktree path>
+    local project
+    project=$(env_or "$1/.env" COMPOSE_PROJECT_NAME "")
+    if [ -z "$project" ] || [ "$project" = "$(detect_main_project)" ]; then
+        project=$(worktree_project "$1")
+    fi
+    printf '%s' "$project"
+}
+
+# --- port allocation --------------------------------------------------------
+#
+# A port counts as unavailable if anything on the host is listening on it, or if
+# any container -- running or stopped, from this project or any other -- has it
+# published. Both checks run again at "up" time, because a port that was free
+# when the worktree was created may have been taken since.
+
+port_listening_on_host() { # <port>
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+port_published_by_docker() { # <port>
+    docker ps -a --format '{{.Ports}}' 2>/dev/null | tr ',' '\n' | grep -q ":$1->"
+}
+
+port_published_by_project() { # <port> <project>
+    docker ps -a --format '{{.Ports}}' --filter "label=com.docker.compose.project=$2" \
+        2>/dev/null | tr ',' '\n' | grep -q ":$1->"
+}
+
+port_taken() { # <port>
+    port_listening_on_host "$1" || port_published_by_docker "$1"
+}
+
+port_claimed_by_another_env() { # <port> <key>
+    local port=$1 key=$2 f v
+    for f in "$MAIN_ENV" "$MAIN_ROOT"/.claude/worktrees/*/.env; do
+        [ -f "$f" ] || continue
+        [ "$f" != "$ENV_FILE" ] || continue
+        v=$(env_or "$f" "$key" "")
+        if [ "$v" = "$port" ]; then return 0; fi
+    done
+    return 1
+}
+
+alloc_port() { # <base> <key>
+    local p=$1 key=$2
+    while :; do
+        if port_claimed_by_another_env "$p" "$key" || port_taken "$p"; then
+            p=$((p + 1)); continue
+        fi
+        break
+    done
+    printf '%s' "$p"
+}
+
+# Keep <key> if it is still usable, otherwise move it to a free port.
+revalidate_port() { # <key> <base> <own project>
+    local key=$1 base=$2 project=$3 port fresh
+    port=$(env_or "$ENV_FILE" "$key" "")
+    if [ -n "$port" ]; then
+        if ! port_taken "$port"; then printf '%s' "$port"; return 0; fi
+        # Already published by our own container: that is this worktree's port.
+        if port_published_by_project "$port" "$project"; then printf '%s' "$port"; return 0; fi
+    fi
+    fresh=$(alloc_port "$base" "$key")
+    [ -z "$port" ] || warn "port $port is in use by something else; moving $key to $fresh"
+    env_set "$ENV_FILE" "$key" "$fresh"
+    printf '%s' "$fresh"
+}
+
+# --- docker helpers ---------------------------------------------------------
+
+compose_container() { # <project> <service>
+    docker ps -q \
+        --filter "label=com.docker.compose.project=$1" \
+        --filter "label=com.docker.compose.service=$2" | head -n 1
+}
+
+require_shared_services() { # <project>
+    local project=$1 svc missing=""
+    for svc in $SHARED_SERVICES; do
+        [ -n "$(compose_container "$project" "$svc")" ] || missing="$missing $svc"
+    done
+    if [ -n "$missing" ]; then
+        info "starting shared services in the main checkout:$missing"
+        ( cd "$MAIN_ROOT" && ./vendor/bin/sail up -d $SHARED_SERVICES )
+    fi
+    docker network inspect "${project}_sail" >/dev/null 2>&1 \
+        || die "shared network '${project}_sail' is missing; run 'sail up -d' in $MAIN_ROOT first"
+}
+
+wait_for_pgsql() { # <container> <user>
+    local i=0
+    while [ "$i" -lt 60 ]; do
+        docker exec "$1" pg_isready -q -U "$2" >/dev/null 2>&1 && return 0
+        sleep 1; i=$((i + 1))
+    done
+    return 1
+}
+
+ensure_database() { # <project> <user> <database>
+    local pg
+    pg=$(compose_container "$1" pgsql)
+    [ -n "$pg" ] || die "the shared 'pgsql' container is not running"
+    wait_for_pgsql "$pg" "$2" || die "postgres did not become ready in time"
+    if docker exec "$pg" psql -U "$2" -d postgres -tAc \
+            "SELECT 1 FROM pg_database WHERE datname = '$3'" 2>/dev/null | grep -q '^1$'; then
+        info "database '$3' already exists on the shared postgres"
+    else
+        docker exec "$pg" psql -U "$2" -d postgres -q -c \
+            "CREATE DATABASE \"$3\" OWNER \"$2\"" >/dev/null
+        info "created database '$3' on the shared postgres"
+    fi
+}
+
+drop_database() { # <project> <user> <database>
+    local pg
+    pg=$(compose_container "$1" pgsql)
+    if [ -z "$pg" ]; then warn "pgsql is not running; database '$3' was left in place"; return 0; fi
+    docker exec "$pg" psql -U "$2" -d postgres -q -c \
+        "DROP DATABASE IF EXISTS \"$3\" WITH (FORCE)" >/dev/null 2>&1 \
+        && info "dropped database '$3'" \
+        || warn "could not drop database '$3'"
+}
+
+flush_redis_prefix() { # <project> <prefix>
+    local rd
+    [ -n "$2" ] || return 0
+    rd=$(compose_container "$1" redis)
+    [ -n "$rd" ] || return 0
+    docker exec "$rd" sh -c \
+        "redis-cli --scan --pattern '$2*' | xargs -r -n 100 redis-cli DEL >/dev/null" 2>/dev/null \
+        && info "flushed redis keys matching '$2*'" || true
+}
+
+wait_for_container() { # <project> <service>
+    local i=0
+    while [ "$i" -lt 60 ]; do
+        [ -n "$(compose_container "$1" "$2")" ] && return 0
+        sleep 1; i=$((i + 1))
+    done
+    return 1
+}
+
+wait_for_http() { # <port>
+    local i=0
+    while [ "$i" -lt 90 ]; do
+        curl -sfo /dev/null "http://localhost:$1" && return 0
+        sleep 1; i=$((i + 1))
+    done
+    return 1
+}
+
+# Remove every Docker object Compose created for a worktree's project. The
+# shared network and the shared pgsql/redis volumes carry the *main* project's
+# labels, so they are never selected here; the guard below makes that explicit.
+sweep_docker_project() { # <project>
+    local project=$1 ids
+    [ -n "$project" ] || return 0
+    if [ "$project" = "$(detect_main_project)" ]; then
+        warn "refusing to sweep '$project': that is the main checkout's project"
+        return 0
+    fi
+
+    ids=$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)
+    if [ -n "$ids" ]; then
+        docker rm -f $ids >/dev/null 2>&1 || true
+        info "removed containers for project '$project'"
+    fi
+    ids=$(docker network ls -q --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)
+    if [ -n "$ids" ]; then
+        docker network rm $ids >/dev/null 2>&1 || true
+        info "removed networks for project '$project'"
+    fi
+    ids=$(docker volume ls -q --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)
+    if [ -n "$ids" ]; then
+        docker volume rm -f $ids >/dev/null 2>&1 || true
+        info "removed volumes for project '$project'"
+    fi
+}
+
+# --- commands ---------------------------------------------------------------
+
+assert_worktree() {
+    [ "$WORKTREE_ROOT" != "$MAIN_ROOT" ] || die \
+        "this is the main checkout; it runs the stock Sail stack with 'sail up -d'"
+}
+
+cmd_init() {
+    assert_worktree
+
+    local project slug slug_ mainport mainvite app_port vite_port db main_db own
+
+    project=$(detect_main_project)
+    slug=$(slugify "$(basename "$WORKTREE_ROOT")")
+    slug_=$(printf '%s' "$slug" | tr '-' '_')
+    own="${project}-${slug}"
+
+    if [ ! -f "$ENV_FILE" ]; then
+        [ -f "$MAIN_ENV" ] || die "no .env in the worktree and none in $MAIN_ROOT to copy"
+        warn ".env was not carried over; copying it from the main checkout"
+        cp "$MAIN_ENV" "$ENV_FILE"
+    fi
+
+    # A freshly-copied .env still holds the main checkout's ports, so a value
+    # equal to those (or missing) means "not yet allocated for this worktree".
+    mainport=$(env_or "$MAIN_ENV" APP_PORT 80)
+    mainvite=$(env_or "$MAIN_ENV" VITE_PORT 5173)
+    app_port=$(env_or "$ENV_FILE" APP_PORT "")
+    vite_port=$(env_or "$ENV_FILE" VITE_PORT "")
+    if [ -z "$app_port" ] || [ "$app_port" = "$mainport" ]; then
+        env_set "$ENV_FILE" APP_PORT "$(alloc_port "$APP_PORT_BASE" APP_PORT)"
+    fi
+    if [ -z "$vite_port" ] || [ "$vite_port" = "$mainvite" ]; then
+        env_set "$ENV_FILE" VITE_PORT "$(alloc_port "$VITE_PORT_BASE" VITE_PORT)"
+    fi
+    # Re-check against the live system, in case the port was taken since.
+    app_port=$(revalidate_port APP_PORT  "$APP_PORT_BASE"  "$own")
+    vite_port=$(revalidate_port VITE_PORT "$VITE_PORT_BASE" "$own")
+
+    main_db=$(env_or "$MAIN_ENV" DB_DATABASE laravel)
+    db=$(printf '%s_%s' "$main_db" "$slug_" | cut -c1-63)
+
+    # Point Sail at the worktree-only Compose file and at the main project's
+    # network. Because SAIL_FILES makes Sail pass an explicit -f, compose.yaml is
+    # not loaded here at all, so pgsql/redis/mailpit are never duplicated.
+    env_set "$ENV_FILE" SAIL_FILES           "compose.worktree.yaml"
+    env_set "$ENV_FILE" SAIL_SHARED_NETWORK  "${project}_sail"
+    env_set "$ENV_FILE" COMPOSE_PROJECT_NAME "$own"
+
+    env_set "$ENV_FILE" APP_URL "http://localhost:${app_port}"
+
+    # Same Postgres server, own database. Same Redis, own key namespace.
+    env_set "$ENV_FILE" DB_DATABASE  "$db"
+    env_set "$ENV_FILE" REDIS_PREFIX "${slug_}_database_"
+    env_set "$ENV_FILE" CACHE_PREFIX "${slug_}_cache_"
+
+    info "configured worktree ${BOLD}${slug}${NC}"
+    printf '    compose project : %s\n' "$own"
+    printf '    shared network  : %s\n' "${project}_sail"
+    printf '    app             : http://localhost:%s\n' "$app_port"
+    printf '    vite            : %s\n' "$vite_port"
+    printf '    database        : %s\n' "$db"
+}
+
+cmd_up() {
+    assert_worktree
+    cmd_init
+
+    local project user db app_port
+    project=$(detect_main_project)
+    require_shared_services "$project"
+
+    user=$(env_or "$ENV_FILE" DB_USERNAME sail)
+    db=$(env_or "$ENV_FILE" DB_DATABASE laravel)
+    ensure_database "$project" "$user" "$db"
+
+    info "starting this worktree's application container"
+    ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail up -d )
+    wait_for_container "$(resolve_project "$WORKTREE_ROOT")" laravel.test \
+        || die "the application container did not start"
+
+    # Migrate before probing HTTP: the session driver is "database", so every
+    # request 500s until the schema exists.
+    ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail artisan migrate --force )
+
+    app_port=$(env_or "$ENV_FILE" APP_PORT 80)
+    wait_for_http "$app_port" \
+        || warn "http://localhost:$app_port has not answered yet"
+
+    info "worktree is up on ${BOLD}http://localhost:${app_port}${NC}"
+}
+
+cmd_down() {
+    assert_worktree
+    if worktree_is_configured "$WORKTREE_ROOT"; then
+        ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail down --remove-orphans ) || true
+    else
+        warn "this worktree's .env has not been configured yet; not invoking Sail"
+    fi
+    sweep_docker_project "$(resolve_project "$WORKTREE_ROOT")"
+}
+
+# Everything cmd_down does, plus the state this worktree kept on the shared
+# services: its database and its Redis keys.
+teardown() { # <worktree path>
+    local path=$1 env project main_project
+    env="$path/.env"
+    main_project=$(detect_main_project)
+    project=$(resolve_project "$path")
+
+    if [ -x "$path/vendor/bin/sail" ] && worktree_is_configured "$path"; then
+        ( cd "$path" && ./vendor/bin/sail down --remove-orphans --volumes ) >/dev/null 2>&1 || true
+    fi
+    # Label-based sweep, which is scoped to this worktree's project by construction.
+    sweep_docker_project "$project"
+
+    if [ -f "$env" ]; then
+        # A worktree whose .env was never rewritten still points at the main
+        # checkout's database and prefixes. Those must never be deleted here.
+        local db main_db prefix
+        db=$(env_or "$env" DB_DATABASE "")
+        main_db=$(env_or "$MAIN_ENV" DB_DATABASE laravel)
+        if [ -n "$db" ] && [ "$db" != "$main_db" ]; then
+            drop_database "$main_project" "$(env_or "$env" DB_USERNAME sail)" "$db"
+        else
+            warn "left database '$db' alone: it is the main checkout's own database"
+        fi
+        for prefix in "$(env_or "$env" REDIS_PREFIX "")" "$(env_or "$env" CACHE_PREFIX "")"; do
+            [ -n "$prefix" ] || continue
+            [ "$prefix" != "$(env_or "$MAIN_ENV" REDIS_PREFIX "")" ] || continue
+            [ "$prefix" != "$(env_or "$MAIN_ENV" CACHE_PREFIX "")" ] || continue
+            flush_redis_prefix "$main_project" "$prefix"
+        done
+    fi
+}
+
+cmd_destroy() {
+    assert_worktree
+    teardown "$WORKTREE_ROOT"
+    info "docker and database state for this worktree is gone; the files remain"
+}
+
+cmd_remove() {
+    local name=${1:-} drop_branch=${2:-} dir
+    [ -n "$name" ] || die "usage: worktree-sail remove <name> [--branch]"
+    dir="$MAIN_ROOT/.claude/worktrees/$name"
+    [ -d "$dir" ] || die "no worktree at $dir"
+    [ "$dir" != "$WORKTREE_ROOT" ] || die "run this from the main checkout, not from inside $name"
+
+    local branch
+    branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+
+    teardown "$dir"
+    git -C "$MAIN_ROOT" worktree remove --force "$dir"
+    info "removed worktree $name"
+
+    if [ "$drop_branch" = "--branch" ] && [ -n "$branch" ] && [ "$branch" != "HEAD" ]; then
+        git -C "$MAIN_ROOT" branch -D "$branch" >/dev/null && info "deleted branch $branch"
+    fi
+}
+
+cmd_status() {
+    local project path branch env app_port db state svc cid
+    project=$(detect_main_project)
+
+    printf '%sshared services%s  (compose project %s)\n' "$BOLD" "$NC" "$project"
+    for svc in $SHARED_SERVICES; do
+        cid=$(compose_container "$project" "$svc")
+        if [ -n "$cid" ]; then
+            printf '    %-8s up    %s\n' "$svc" \
+                "$(docker ps --format '{{.Ports}}' --filter "id=$cid" | head -n1)"
+        else
+            printf '    %-8s down\n' "$svc"
+        fi
+    done
+
+    printf '\n%s%-24s %-20s %-6s %-5s %s%s\n' "$BOLD" "worktree" "branch" "port" "state" "database" "$NC"
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+        env="$path/.env"
+        app_port=$(env_or "$env" APP_PORT "-")
+        db=$(env_or "$env" DB_DATABASE "-")
+        if [ "$path" = "$MAIN_ROOT" ]; then
+            cid=$(compose_container "$project" laravel.test)
+        else
+            cid=$(compose_container "$(resolve_project "$path")" laravel.test)
+        fi
+        [ -n "$cid" ] && state=up || state=down
+        printf '    %-24s %-20s %-6s %-5s %s\n' \
+            "$([ "$path" = "$MAIN_ROOT" ] && echo '(main checkout)' || basename "$path")" \
+            "$branch" "$app_port" "$state" "$db"
+    done < <(git -C "$MAIN_ROOT" worktree list --porcelain | awk '/^worktree /{print substr($0,10)}')
+}
+
+# Mirrors what Claude Code does with .worktreeinclude, for worktrees created by
+# hand. `git ls-files --others --ignored --exclude-from=<file>` lists exactly the
+# untracked entries those patterns select.
+copy_includes() { # <destination>
+    local dest=$1 entry src
+    [ -f "$MAIN_ROOT/.worktreeinclude" ] || return 0
+    while IFS= read -r entry; do
+        entry=${entry%/}
+        [ -n "$entry" ] || continue
+        src="$MAIN_ROOT/$entry"
+        [ -e "$src" ] || continue
+        if [ -L "$src" ]; then continue; fi
+        mkdir -p "$dest/$(dirname "$entry")"
+        # -c clones on APFS: near-instant, and costs no extra disk space.
+        cp -Rc "$src" "$dest/$entry" 2>/dev/null || cp -R "$src" "$dest/$entry"
+        info "copied $entry"
+    done < <(cd "$MAIN_ROOT" && git ls-files --others --ignored --directory \
+                 --exclude-from=.worktreeinclude)
+}
+
+cmd_create() {
+    local name=${1:-} base=${2:-main} dir
+    [ -n "$name" ] || die "usage: worktree-sail create <branch> [base]"
+    dir="$MAIN_ROOT/.claude/worktrees/$name"
+    [ ! -e "$dir" ] || die "$dir already exists"
+    git -C "$MAIN_ROOT" worktree add -b "$name" "$dir" "$base"
+    copy_includes "$dir"
+    # Run it from inside the new worktree: the script resolves which worktree it
+    # is acting on from the working directory, not from its own path.
+    ( cd "$dir" && ./bin/worktree-sail up )
+}
+
+case "${1:-}" in
+    init)    shift; cmd_init "$@" ;;
+    up)      shift; cmd_up "$@" ;;
+    down)    shift; cmd_down "$@" ;;
+    destroy) shift; cmd_destroy "$@" ;;
+    status)  shift; cmd_status "$@" ;;
+    create)  shift; cmd_create "$@" ;;
+    remove)  shift; cmd_remove "$@" ;;
+    *)       sed -n '3,32p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'; exit 1 ;;
+esac
