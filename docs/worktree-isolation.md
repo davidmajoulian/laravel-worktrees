@@ -48,6 +48,7 @@ Run these from anywhere inside the checkout you mean.
 | `bin/worktree-sail down` | stop and remove this worktree's container |
 | `bin/worktree-sail destroy` | …plus its networks, volumes, database and cache keys |
 | `bin/worktree-sail remove <name> [--branch]` | destroy everything, then drop the worktree |
+| `bin/worktree-sail teardown <path>` | Docker and database cleanup only, no git |
 
 The main checkout is ordinary Sail: `sail up -d`, `sail down`. The script
 refuses to act on it.
@@ -203,6 +204,55 @@ The shared services, their volumes and the shared network are all selected by th
 *main* project's labels, so they are never in scope. Two guards make that
 explicit: `resolve_project()` never resolves a worktree to the main project, and
 the database drop refuses to touch the main checkout's database.
+
+### When Claude Code removes the worktree for you
+
+Claude Code removes a worktree on its own when you exit a session that created
+one with `--worktree`, when a subagent finishes, and when the periodic sweep
+collects an old background-session worktree. It deletes the directory and the
+branch; it knows nothing about the container or the database, so those are left
+behind — one set per branch, quietly accumulating.
+
+Clean up afterwards with:
+
+```bash
+bin/worktree-sail teardown .claude/worktrees/<name>
+```
+
+That works *after the fact*. `teardown` derives the Compose project and database
+name from the directory name the same way `init` did, so neither the directory
+nor its `.env` has to still exist.
+
+Using `bin/worktree-sail remove <name>` instead avoids the situation entirely,
+since it tears down Docker and the database before removing the worktree.
+
+### Why not a WorktreeRemove hook?
+
+Claude Code has `WorktreeCreate` and `WorktreeRemove` hooks, and a
+`WorktreeRemove` hook calling `teardown` would close the gap above
+automatically. It does not work, and both halves are worth knowing:
+
+- **`WorktreeCreate` replaces git worktree creation** rather than supplementing
+  it. The documentation is explicit that `.worktreeinclude` is then not processed
+  at all, and a hook-created worktree also loses the marker Claude Code writes
+  into git metadata, so the cleanup sweep never collects it. Adopting it means
+  reimplementing base-branch selection, PR branching, the symlink refusals and
+  filter-driver neutralisation. Not worth it.
+- **`WorktreeRemove` does not fire for a worktree Claude Code created with git.**
+  Tested directly on Claude Code v2.1.226: a real `claude --worktree` session was
+  driven to exit, it reported `Cleaning up worktree (no pending changes)…`, and
+  the worktree directory and branch were gone afterwards — but the hook never
+  ran. A `SessionStart` hook configured alongside it *did* fire in that same
+  session, so hooks were loading and executing; only `WorktreeRemove` stayed
+  silent. It appears to be reserved for worktrees a `WorktreeCreate` hook made,
+  which matches the documentation presenting the pair under "non-git version
+  control".
+
+One incidental finding from that test: hooks in a project's
+`.claude/settings.json` did not run at all in a fresh session, while the same
+hooks in `~/.claude/settings.json` did. Project-scoped hooks need the workspace
+trust or approval that a scripted session never grants — worth remembering when
+a project hook seems to do nothing.
 
 ## Verifying it
 

@@ -460,6 +460,24 @@ and flush its Redis keys by prefix, and finally `git worktree remove`.
 Verify a teardown by diffing the world before and after: only the worktree's own
 container, database and keys should be gone.
 
+Give the script a way to do this cleanup *after the fact*, deriving the Compose
+project and database name from the worktree's directory name rather than reading
+its `.env`. You need it because Claude Code removes worktrees on its own — at
+session exit, when a subagent finishes, or through its cleanup sweep — and by
+then the directory and its `.env` are gone, while the container and database are
+still there.
+
+The obvious fix is a `WorktreeRemove` hook, and it does not work: on Claude Code
+v2.1.226 that hook does not fire for a worktree created with git, only for one a
+`WorktreeCreate` hook made — and `WorktreeCreate` replaces git worktree creation
+entirely, which costs you `.worktreeinclude` processing among much else. See
+[worktree-isolation.md](worktree-isolation.md#why-not-a-worktreeremove-hook).
+Until that changes, run the cleanup yourself:
+
+```bash
+bin/worktree-sail teardown .claude/worktrees/<name>
+```
+
 ---
 
 ## Step 10 — Make the isolation observable
@@ -504,3 +522,5 @@ container, so using it makes every checkout call itself "html".
 | `--directory` collapses untracked dirs | `.worktreeinclude` pattern never matches | match the directory (`/bin/`), not a file in it |
 | `base_path()` in a container | every checkout is called "html" | `IGNITION_LOCAL_SITES_PATH` |
 | Docker credential helper hangs | pulls stall on `error getting credentials` | restart Docker Desktop, or drop `credsStore` |
+| Claude Code removed the worktree itself | container and database orphaned | `worktree-sail teardown <path>`; a `WorktreeRemove` hook will not do it |
+| Hooks in project `.claude/settings.json` | never run in a fresh session | put them in `~/.claude/settings.json`, which is trusted |
