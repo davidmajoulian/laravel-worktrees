@@ -7,6 +7,21 @@
 <a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
 </p>
 
+## This repository
+
+A sandbox for running **one isolated Laravel Sail environment per git worktree**:
+each checkout gets its own application container, port and database, while a
+single Postgres, Redis and Mailpit are shared between all of them.
+
+    bin/worktree-sail create my-feature   # worktree + database + container, ~7s
+    bin/worktree-sail status              # every checkout, its port and database
+    bin/worktree-sail remove my-feature   # tear all of it back down
+
+See **[docs/worktree-isolation.md](docs/worktree-isolation.md)** for how it works
+and why. The commit history is ordered to be read from the first commit onwards:
+`git log --reverse --patch` walks from a stock Laravel install through each piece
+of the setup.
+
 ## About Laravel
 
 Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
