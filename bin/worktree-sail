@@ -20,7 +20,8 @@
 # Usage, from anywhere inside a worktree:
 #   worktree-sail up                  configure this worktree, then start it
 #   worktree-sail init                write .env only, touch no containers
-#   worktree-sail prepare             init + shared services + database, no container
+#   worktree-sail prepare             init + shared services + databases, no container
+#   worktree-sail testing-env         (re)write .env.testing; works in main too
 #   worktree-sail down                stop and remove this worktree's container
 #   worktree-sail destroy             ... plus its network, volumes, database and cache
 #   worktree-sail status              list every worktree, its ports and state
@@ -141,7 +142,33 @@ worktree_slug() { # <worktree path>
 
 worktree_database() { # <worktree path>
     printf '%s_%s' "$(env_or "$MAIN_ENV" DB_DATABASE laravel)" "$(worktree_slug "$1")" \
-        | cut -c1-63
+        | cut -c1-55
+}
+
+# The database a checkout's test suite uses. phpunit.xml is tracked, so it cannot
+# name a different database per worktree; the name lives in .env.testing instead,
+# which Laravel loads *instead of* .env because phpunit.xml sets APP_ENV=testing.
+# The main checkout uses the "testing" database Sail's own init script creates.
+testing_database_for() { # <checkout path>
+    local db
+    if [ "$1" = "$MAIN_ROOT" ]; then printf 'testing'; return 0; fi
+    db=$(env_or "$1/.env" DB_DATABASE "")
+    if [ -z "$db" ] || [ "$db" = "$(env_or "$MAIN_ENV" DB_DATABASE laravel)" ]; then
+        db=$(worktree_database "$1")
+    fi
+    printf '%s_testing' "$db"
+}
+
+# .env.testing is the whole environment a test run sees, so it is a copy of the
+# checkout's .env with only the database swapped. Regenerating it from .env keeps
+# it in step with this checkout's key, ports and service hosts.
+write_testing_env() { # <checkout path>
+    local src="$1/.env" out="$1/.env.testing" db
+    [ -f "$src" ] || die "no .env in $1"
+    db=$(testing_database_for "$1")
+    cp "$src" "$out"
+    env_set "$out" DB_DATABASE "$db"
+    printf '%s' "$db"
 }
 
 # The Compose project a worktree owns. A worktree whose .env was copied but never
@@ -391,12 +418,24 @@ cmd_init() {
     env_set "$ENV_FILE" REDIS_PREFIX "${slug_}_database_"
     env_set "$ENV_FILE" CACHE_PREFIX "${slug_}_cache_"
 
+    write_testing_env "$WORKTREE_ROOT" >/dev/null
+
     info "configured worktree ${BOLD}${slug}${NC}"
     printf '    compose project : %s\n' "$own"
     printf '    shared network  : %s\n' "${project}_sail"
     printf '    app             : http://localhost:%s\n' "$app_port"
     printf '    vite            : %s\n' "$vite_port"
     printf '    database        : %s\n' "$db"
+    printf '    test database   : %s\n' "$(testing_database_for "$WORKTREE_ROOT")"
+}
+
+# Regenerate .env.testing for whichever checkout you are standing in. Unlike the
+# other commands this one also works in the main checkout, which needs the file
+# for the same reason a worktree does.
+cmd_testing_env() {
+    local db
+    db=$(write_testing_env "$WORKTREE_ROOT")
+    info "wrote .env.testing for $(basename "$WORKTREE_ROOT") -> database '$db'"
 }
 
 # Everything `up` does except starting the container: give this worktree its own
@@ -412,6 +451,8 @@ cmd_prepare() {
     require_shared_services "$project"
     ensure_database "$project" \
         "$(env_or "$ENV_FILE" DB_USERNAME sail)" "$(env_or "$ENV_FILE" DB_DATABASE laravel)"
+    ensure_database "$project" \
+        "$(env_or "$ENV_FILE" DB_USERNAME sail)" "$(testing_database_for "$WORKTREE_ROOT")"
 }
 
 cmd_up() {
@@ -472,6 +513,14 @@ teardown() { # <worktree path>
         drop_database "$main_project" "$(env_or "$env" DB_USERNAME sail)" "$db"
     else
         warn "left database '$db' alone: it is the main checkout's own database"
+    fi
+
+    local tdb
+    tdb=$(testing_database_for "$path")
+    if [ "$tdb" != "$(testing_database_for "$MAIN_ROOT")" ]; then
+        drop_database "$main_project" "$(env_or "$env" DB_USERNAME sail)" "$tdb"
+    else
+        warn "left database '$tdb' alone: it is the main checkout's test database"
     fi
 
     for prefix in \
@@ -591,6 +640,7 @@ cmd_create() {
 
 case "${1:-}" in
     init)    shift; cmd_init "$@" ;;
+    testing-env) shift; cmd_testing_env "$@" ;;
     prepare) shift; cmd_prepare "$@" ;;
     up)      shift; cmd_up "$@" ;;
     down)    shift; cmd_down "$@" ;;
