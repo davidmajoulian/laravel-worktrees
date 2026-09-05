@@ -46,13 +46,26 @@ in between, deliberately.
 | Database | the Postgres **server** | `laravel_<name>` and `laravel_<name>_testing` |
 | Redis | the Redis **instance** | its own key prefix |
 
-## Quick start
-
-Start the main checkout the ordinary Sail way — it owns the shared services:
+## Getting started
 
 ```bash
-sail up -d
+git clone https://github.com/davidmajoulian/laravel-worktrees.git
+cd laravel-worktrees
+
+cp .env.example .env
+composer install
+npm install
+
+sail up -d                     # builds the image the first time; owns the shared services
+sail artisan key:generate
+sail artisan migrate
+bin/worktree-sail testing-env  # writes .env.testing for the main checkout
 ```
+
+`.env` and `.env.testing` are deliberately git-ignored — they hold each
+checkout's own ports, database names and key prefixes, which is the whole point —
+so those last steps are what a fresh clone needs and a worktree gets generated for
+it automatically.
 
 Then give any branch its own environment:
 
