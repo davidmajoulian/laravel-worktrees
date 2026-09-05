@@ -1,0 +1,31 @@
+# Sail configuration used *only* by git worktrees.
+#
+# A worktree selects this file through Sail's own SAIL_FILES environment
+# variable (set in the worktree's .env by bin/worktree-sail), which makes Sail
+# run `docker compose -f compose.worktree.yaml ...`. Because an explicit -f is
+# passed, Compose does not load compose.yaml at all -- so the stock Sail file
+# stays exactly as `sail:install` generated it and is never overridden here.
+#
+# Only the application container is declared. Postgres, Redis and Mailpit are
+# reused from the main checkout's Sail project by attaching to its network as an
+# external network. Data is kept apart per worktree by database name and by
+# cache/Redis key prefix, not by running a second copy of each service.
+#
+# The service definition itself is inherited from compose.yaml via `extends`, so
+# worktrees automatically pick up whatever `sail:install` / a Sail upgrade puts
+# there (PHP version, volumes, Xdebug wiring, ...). Only `depends_on` is dropped,
+# since the services it names are not part of this project.
+
+services:
+    laravel.test:
+        extends:
+            file: compose.yaml
+            service: laravel.test
+        depends_on: !reset null
+        networks:
+            - sail
+
+networks:
+    sail:
+        external: true
+        name: '${SAIL_SHARED_NETWORK:-learn-worktrees_sail}'
