@@ -25,3 +25,11 @@ _ide_helper.php
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+# Claude Code creates its worktrees inside the repository itself. The worktree
+# directories, and the per-worktree .env that bin/worktree-sail rewrites, are
+# generated local state and must never reach a commit. The tooling that
+# generates them (bin/worktree-sail, compose.worktree.yaml, .worktreeinclude)
+# is tracked, so every worktree inherits it straight from git.
+/.claude/worktrees/
+/.claude/settings.local.json
