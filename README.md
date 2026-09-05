@@ -70,6 +70,25 @@ Open `/status` on any two checkouts side by side to see it: the Postgres address
 Redis run id and Mailpit address match, while the container, database, row counts
 and key prefixes do not.
 
+## Any Sail service, and more than one project
+
+The shared-service list is read from your `compose.yaml`, so whatever
+`sail:install --with=…` installed is handled without touching the script. Each
+worktree gets its own database (Postgres, MySQL, MariaDB or MongoDB — SQLite is
+already per-worktree), plus its own key prefix, Scout prefix, bucket or queue for
+Redis, Valkey, Memcached, Meilisearch, Typesense, MinIO, RustFS and RabbitMQ.
+Mailpit and Selenium are shared as-is.
+
+Running two projects on one machine? Give each its own port band in the main
+`.env` — port detection can't see a project while it's stopped:
+
+```dotenv
+WORKTREE_APP_PORT_BASE=8101
+WORKTREE_VITE_PORT_BASE=5274
+```
+
+See [Running more than one project](docs/worktree-isolation.md#running-more-than-one-project).
+
 ## Commands
 
 | Command | What it does |

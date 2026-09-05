@@ -429,10 +429,32 @@ this order makes it straightforward:
 Three things it has to get right, each learned the hard way:
 
 **Ports must be checked against reality, not just against other `.env` files.**
-A port is unusable if a host process is listening on it (`lsof`) *or* any
-container has it published (`docker ps -a`), running or not. And it must be
-re-checked at start time — a port that was free when the worktree was created may
-not be a week later.
+A port is unusable if a host process is listening on it (`lsof`) *or* a running
+container has it published. And it must be re-checked at start time — a port free
+when the worktree was created may not be a week later.
+
+Know what that check *cannot* do: a stopped container reports no ports at all, so
+it cannot see another project while that project is down. Detection is enough
+inside one project; two projects on one machine need separate port bands, which
+is why the bases are read from `.env` rather than hard-coded:
+
+```dotenv
+WORKTREE_APP_PORT_BASE=8101
+WORKTREE_VITE_PORT_BASE=5274
+```
+
+**Don't hard-code the list of services either.** Read it from the main checkout's
+`compose.yaml` — everything except `laravel.test` — so whatever
+`sail:install --with=…` added is picked up on its own:
+
+```bash
+docker compose config --services | grep -v laravel.test
+```
+
+Then branch on `DB_CONNECTION` for the database work: `psql` for Postgres,
+`mysql` fed over stdin for MySQL and MariaDB (so the backtick quoting survives),
+`db.dropDatabase()` for Mongo, and nothing at all for SQLite, whose file already
+lives inside the worktree.
 
 **The script resolves "which worktree" from the working directory.** So a
 `create` command must invoke the child from *inside* the new worktree, not by
@@ -553,11 +575,14 @@ container, so using it makes every checkout call itself "html".
 
 ## Adapting this to your own project
 
-- **MySQL or MariaDB instead of Postgres.** Same shape. Replace the database
-  creation with `mysql -u root -p"$PW" -e 'CREATE DATABASE ...'` and change the
-  service name in `SHARED_SERVICES`.
-- **A different port range.** `APP_PORT_BASE` / `VITE_PORT_BASE` at the top of
-  `bin/worktree-sail`.
+- **Another database engine.** Nothing to change: `DB_CONNECTION` selects how the
+  per-worktree database is created and dropped, covering Postgres, MySQL,
+  MariaDB, MongoDB and SQLite.
+- **Any other Sail service.** Also nothing to change: the shared-service list is
+  derived from `compose.yaml`, and Meilisearch, Typesense, MinIO, RustFS and
+  RabbitMQ get a per-worktree prefix, bucket or queue name when they are present.
+- **A different port range.** `WORKTREE_APP_PORT_BASE` and
+  `WORKTREE_VITE_PORT_BASE` in the main checkout's `.env`.
 - **An existing project with real data.** Nothing here touches the main
   checkout's database. To give a worktree a copy rather than an empty schema,
   `pg_dump` the main database into the new one after `ensure_database` instead of
@@ -580,3 +605,4 @@ container, so using it makes every checkout call itself "html".
 | PHPUnit `<env>` beats dotenv | `.env.testing` silently ignored | remove the entry from `phpunit.xml`; it cannot be overridden |
 | Claude Code removed the worktree itself | container and database orphaned | `worktree-sail teardown <path>`; a `WorktreeRemove` hook will not do it |
 | Hooks in project `.claude/settings.json` | never run in a fresh session | put them in `~/.claude/settings.json`, which is trusted |
+| A stopped container reports no ports | two projects allocate the same port | give each project a port band; detection cannot see a stopped project |

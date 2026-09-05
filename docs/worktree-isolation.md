@@ -140,8 +140,13 @@ Docker Compose reads `COMPOSE_PROJECT_NAME` from `.env` itself, and
 change.
 
 Ports are allocated from 8001 (app) and 5174 (Vite) upwards, skipping anything a
-host process is listening on and anything any container has published, running or
-not. `up` re-checks at start time and moves the port if it has been taken since.
+host process is listening on and anything a running container has published. `up`
+re-checks at start time and moves the port if it has been taken since.
+
+That detection has a limit worth knowing: a **stopped** container reports no
+ports, so it cannot see a project that is currently down. Within one project that
+is fine — its worktrees are visible to each other through `.env`. Across projects
+it is not, which is what the next section is about.
 
 ## Tracked versus generated
 
@@ -255,6 +260,81 @@ One incidental finding from that test: hooks in a project's
 hooks in `~/.claude/settings.json` did. Project-scoped hooks need the workspace
 trust or approval that a scripted session never grants — worth remembering when
 a project hook seems to do nothing.
+
+## Running more than one project
+
+Nothing here is per-machine-global except the published ports, and those are the
+one thing two projects will fight over. Give each project its own band rather than
+relying on detection, which cannot see a project while it is stopped.
+
+Set the two bases in each project's **main** `.env`; worktrees allocate upwards
+from them:
+
+```dotenv
+# company-b/.env
+WORKTREE_APP_PORT_BASE=8101
+WORKTREE_VITE_PORT_BASE=5274
+```
+
+Then move the shared services out of the way with Sail's own `FORWARD_*`
+variables, which is all `sail up -d` needs — the containers still reach each other
+by service name over the project's own network, so only host access changes.
+
+| | Project A (defaults) | Project B |
+| --- | --- | --- |
+| `APP_PORT` (main) | `80` | `8100` |
+| worktree app ports | `8001…` | `8101…` |
+| `VITE_PORT` (main) | `5173` | `5273` |
+| worktree Vite ports | `5174…` | `5274…` |
+| `FORWARD_DB_PORT` | `5432` / `3306` | `5433` / `3307` |
+| `FORWARD_REDIS_PORT` | `6379` | `6380` |
+| `FORWARD_MAILPIT_PORT` / `_DASHBOARD_PORT` | `1025` / `8025` | `1026` / `8026` |
+
+A band of 100 means you never have to guess a worktree limit. One edge: `8025`
+(Mailpit's dashboard) sits inside project A's `8001–8099` band, so it would matter
+at around 25 simultaneous worktrees — the allocator skips it while Mailpit is
+running, but move the dashboards to `18025`/`18026` if you expect to get there.
+
+The Compose project name comes from each project's directory, so containers,
+networks and volumes are already separate; only the ports need arranging.
+
+### Every other Sail service
+
+The shared-service list is not hard-coded. It is read from the main checkout's
+`compose.yaml` — every service except `laravel.test` — so whatever
+`sail:install --with=…` put there is started, joined and reported without editing
+anything:
+
+```bash
+docker compose config --services | grep -v laravel.test
+```
+
+Databases are handled per engine. `DB_CONNECTION` decides how a worktree's
+database is created and dropped:
+
+| `DB_CONNECTION` | Per-worktree database |
+| --- | --- |
+| `pgsql` | `CREATE DATABASE` / `DROP DATABASE … WITH (FORCE)` |
+| `mysql`, `mariadb` | `CREATE DATABASE IF NOT EXISTS` plus a `GRANT` to `DB_USERNAME` |
+| `mongodb` | created on first write; dropped with `db.dropDatabase()` |
+| `sqlite` | nothing to do — the file lives inside the worktree, so it is isolated already |
+
+The remaining stateful services get a namespace instead of a database, written
+into `.env` only when that service is actually installed:
+
+| Service | Variable | Value |
+| --- | --- | --- |
+| Redis, Valkey, Memcached | `REDIS_PREFIX`, `CACHE_PREFIX` | `<slug>_database_`, `<slug>_cache_` |
+| Meilisearch, Typesense | `SCOUT_PREFIX` | `<slug>_` |
+| MinIO, RustFS | `AWS_BUCKET` | `<slug>` |
+| RabbitMQ | `RABBITMQ_QUEUE` | `<slug>_default` |
+
+Mailpit and Selenium are shared as they are: one inbox for every checkout is
+usually what you want, and Selenium holds no state.
+
+Teardown reclaims the databases and the Redis/Valkey keys. It does **not** delete
+search indexes, object-storage buckets or RabbitMQ queues — the prefixes keep them
+from colliding, but removing them is manual.
 
 ## Tests get their own database too
 
