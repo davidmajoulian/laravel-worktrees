@@ -67,10 +67,14 @@ MAIN_ENV="$MAIN_ROOT/.env"
 
 # --- .env helpers -----------------------------------------------------------
 
+# Reads the *last* occurrence of a key, because that is what both Docker Compose
+# and Laravel's dotenv reader do with a duplicated key -- and a .env edited by
+# appending rather than in place will have duplicates.
 env_get() { # <file> <key>
     local file=$1 key=$2 line
     [ -f "$file" ] || return 1
-    line=$(grep -m1 "^${key}=" "$file" 2>/dev/null) || return 1
+    line=$(grep "^${key}=" "$file" 2>/dev/null | tail -n 1)
+    [ -n "$line" ] || return 1
     line=${line#*=}
     line=${line%\"}
     line=${line#\"}
@@ -82,18 +86,17 @@ env_or() { # <file> <key> <fallback>
     if v=$(env_get "$1" "$2") && [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "$3"; fi
 }
 
+# Writes the key in place at its first position, drops any later duplicates of
+# it, and appends it if it was absent. Collapsing duplicates keeps env_get,
+# Compose and Laravel all reading the same value.
 env_set() { # <file> <key> <value>
     local file=$1 key=$2 value=$3 tmp
     tmp="${file}.worktree-sail.$$"
-    if grep -q "^${key}=" "$file" 2>/dev/null; then
-        awk -v k="$key" -v v="$value" '
-            index($0, k "=") == 1 && !done { print k "=" v; done = 1; next }
-            { print }
-        ' "$file" > "$tmp"
-    else
-        cat "$file" > "$tmp"
-        printf '%s=%s\n' "$key" "$value" >> "$tmp"
-    fi
+    awk -v k="$key" -v v="$value" '
+        index($0, k "=") == 1 { if (!done) { print k "=" v; done = 1 } ; next }
+        { print }
+        END { if (!done) print k "=" v }
+    ' "$file" > "$tmp"
     mv "$tmp" "$file"
 }
 
