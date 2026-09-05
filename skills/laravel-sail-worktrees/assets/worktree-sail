@@ -1,0 +1,775 @@
+#!/usr/bin/env bash
+#
+# worktree-sail -- give every git worktree its own Laravel Sail application
+# container, while reusing one shared set of backing services.
+#
+#   main checkout          compose.yaml           laravel.test + pgsql + redis + mailpit
+#   .claude/worktrees/<x>  compose.worktree.yaml  laravel.test only, attached to the
+#                                                 main project's "sail" network
+#
+# Isolated per worktree : app container, APP_PORT, VITE_PORT, Compose project,
+#                         Postgres database, Redis/cache key prefix.
+# Shared by all of them  : the Postgres, Redis and Mailpit containers.
+#
+# Everything is driven by variables written into the worktree's .env. The
+# Sail-generated compose.yaml is never modified, and nothing this script
+# generates per worktree -- the rewritten .env, the worktree directory itself --
+# is tracked by git. Only the tooling is, so `git worktree add` alone is enough
+# to give a new worktree this script and compose.worktree.yaml.
+#
+# Usage, from anywhere inside a worktree:
+#   worktree-sail up                  configure this worktree, then start it
+#   worktree-sail init                write .env only, touch no containers
+#   worktree-sail prepare             init + shared services + databases, no container
+#   worktree-sail testing-env         (re)write .env.testing; works in main too
+#   worktree-sail down                stop and remove this worktree's container
+#   worktree-sail destroy             ... plus its network, volumes, database and cache
+#   worktree-sail status              list every worktree, its ports and state
+#
+# And from anywhere in the repository:
+#   worktree-sail create <branch> [base]   git worktree add + copy + up
+#   worktree-sail remove <name> [--branch] destroy everything, then drop the worktree
+#   worktree-sail teardown <path>          docker/database cleanup only, no git;
+#                                          this is what the WorktreeRemove hook calls
+
+set -euo pipefail
+
+
+if [ -t 1 ]; then
+    BOLD=$(tput bold 2>/dev/null || true); RED=$(tput setaf 1 2>/dev/null || true)
+    GREEN=$(tput setaf 2 2>/dev/null || true); YELLOW=$(tput setaf 3 2>/dev/null || true)
+    NC=$(tput sgr0 2>/dev/null || true)
+else
+    BOLD=""; RED=""; GREEN=""; YELLOW=""; NC=""
+fi
+
+info() { printf '%s==>%s %s\n' "$GREEN" "$NC" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$YELLOW" "$NC" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
+
+# --- locate the main checkout and the current worktree ----------------------
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "not inside a git repository"
+
+WORKTREE_ROOT=$(cd "$(git rev-parse --show-toplevel)" && pwd -P)
+cd "$WORKTREE_ROOT"
+
+COMMON_DIR=$(git rev-parse --git-common-dir)
+case "$COMMON_DIR" in
+    /*) ;;
+    *)  COMMON_DIR="$WORKTREE_ROOT/$COMMON_DIR" ;;
+esac
+MAIN_ROOT=$(cd "$(dirname "$COMMON_DIR")" && pwd -P)
+
+ENV_FILE="$WORKTREE_ROOT/.env"
+MAIN_ENV="$MAIN_ROOT/.env"
+
+# --- .env helpers -----------------------------------------------------------
+
+# Reads the *last* occurrence of a key, because that is what both Docker Compose
+# and Laravel's dotenv reader do with a duplicated key -- and a .env edited by
+# appending rather than in place will have duplicates.
+env_get() { # <file> <key>
+    local file=$1 key=$2 line
+    [ -f "$file" ] || return 1
+    line=$(grep "^${key}=" "$file" 2>/dev/null | tail -n 1)
+    [ -n "$line" ] || return 1
+    line=${line#*=}
+    line=${line%\"}
+    line=${line#\"}
+    printf '%s' "$line"
+}
+
+env_or() { # <file> <key> <fallback>
+    local v
+    if v=$(env_get "$1" "$2") && [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "$3"; fi
+}
+
+# Writes the key in place at its first position, drops any later duplicates of
+# it, and appends it if it was absent. Collapsing duplicates keeps env_get,
+# Compose and Laravel all reading the same value.
+env_set() { # <file> <key> <value>
+    local file=$1 key=$2 value=$3 tmp
+    tmp="${file}.worktree-sail.$$"
+    awk -v k="$key" -v v="$value" '
+        index($0, k "=") == 1 { if (!done) { print k "=" v; done = 1 } ; next }
+        { print }
+        END { if (!done) print k "=" v }
+    ' "$file" > "$tmp"
+    mv "$tmp" "$file"
+}
+
+slugify() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+        | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//'
+}
+
+detect_main_project() {
+    local n
+    n=$(env_or "$MAIN_ENV" COMPOSE_PROJECT_NAME "")
+    [ -n "$n" ] || n=$(slugify "$(basename "$MAIN_ROOT")")
+    printf '%s' "$n"
+}
+
+worktree_project() { # <worktree path>
+    printf '%s-%s' "$(detect_main_project)" "$(slugify "$(basename "$1")")"
+}
+
+# True only when this worktree's .env has actually been rewritten to describe its
+# own isolated stack. Until then the .env is still a verbatim copy of the main
+# checkout's, naming the main project and the stock compose.yaml -- running
+# `sail down --volumes` against it would delete the main checkout's containers
+# and data volumes.
+worktree_is_configured() { # <worktree path>
+    local env=$1/.env
+    [ -f "$env" ] || return 1
+    [ "$(env_or "$env" SAIL_FILES "")" = "compose.worktree.yaml" ] || return 1
+    [ "$(env_or "$env" COMPOSE_PROJECT_NAME "")" != "$(detect_main_project)" ] || return 1
+    return 0
+}
+
+# The database and key prefixes a worktree owns, derived from its directory name
+# exactly as cmd_init derives them. Teardown needs these because the
+# WorktreeRemove hook can fire once the worktree directory is already gone,
+# taking its .env with it.
+worktree_slug() { # <worktree path>
+    slugify "$(basename "$1")" | tr '-' '_'
+}
+
+worktree_database() { # <worktree path>
+    printf '%s_%s' "$(env_or "$MAIN_ENV" DB_DATABASE laravel)" "$(worktree_slug "$1")" \
+        | cut -c1-55
+}
+
+# The database a checkout's test suite uses. phpunit.xml is tracked, so it cannot
+# name a different database per worktree; the name lives in .env.testing instead,
+# which Laravel loads *instead of* .env because phpunit.xml sets APP_ENV=testing.
+# The main checkout uses the "testing" database Sail's own init script creates.
+testing_database_for() { # <checkout path>
+    local db
+    if [ "$1" = "$MAIN_ROOT" ]; then printf 'testing'; return 0; fi
+    db=$(env_or "$1/.env" DB_DATABASE "")
+    if [ -z "$db" ] || [ "$db" = "$(env_or "$MAIN_ENV" DB_DATABASE laravel)" ]; then
+        db=$(worktree_database "$1")
+    fi
+    printf '%s_testing' "$db"
+}
+
+# .env.testing is the whole environment a test run sees, so it is a copy of the
+# checkout's .env with only the database swapped. Regenerating it from .env keeps
+# it in step with this checkout's key, ports and service hosts.
+write_testing_env() { # <checkout path>
+    local src="$1/.env" out="$1/.env.testing" db
+    [ -f "$src" ] || die "no .env in $1"
+    db=$(testing_database_for "$1")
+    cp "$src" "$out"
+    env_set "$out" DB_DATABASE "$db"
+    printf '%s' "$db"
+}
+
+# The Compose project a worktree owns. A worktree whose .env was copied but never
+# rewritten still names the *main* project, which must never be treated as its
+# own, so fall back to the derived name in that case.
+resolve_project() { # <worktree path>
+    local project
+    project=$(env_or "$1/.env" COMPOSE_PROJECT_NAME "")
+    if [ -z "$project" ] || [ "$project" = "$(detect_main_project)" ]; then
+        project=$(worktree_project "$1")
+    fi
+    printf '%s' "$project"
+}
+
+# --- per-project configuration ----------------------------------------------
+#
+# Two projects on one machine must not hand their worktrees the same ports. Give
+# each project its own band from the main checkout's .env:
+#
+#     WORKTREE_APP_PORT_BASE=8101
+#     WORKTREE_VITE_PORT_BASE=5274
+#
+# and move the shared services' published ports out of the way with Sail's own
+# FORWARD_* variables. See docs/worktree-isolation.md, "Running more than one
+# project", for a worked band.
+APP_PORT_BASE=$(env_or "$MAIN_ENV" WORKTREE_APP_PORT_BASE 8001)
+VITE_PORT_BASE=$(env_or "$MAIN_ENV" WORKTREE_VITE_PORT_BASE 5174)
+APP_SERVICE=$(env_or "$MAIN_ENV" APP_SERVICE laravel.test)
+
+# Every service the main checkout's compose.yaml defines except the application
+# itself. Derived rather than listed, so whatever `sail:install --with=...` put
+# there -- mysql, valkey, meilisearch, minio, rabbitmq -- is handled without
+# editing this script.
+_SHARED_SERVICES=""
+shared_services() {
+    if [ -z "$_SHARED_SERVICES" ]; then
+        _SHARED_SERVICES=$(
+            cd "$MAIN_ROOT" \
+                && WWWUSER="${WWWUSER:-$(id -u)}" WWWGROUP="${WWWGROUP:-$(id -g)}" \
+                   docker compose config --services 2>/dev/null \
+                | grep -v "^${APP_SERVICE}$" | sort | tr '\n' ' '
+        )
+    fi
+    printf '%s' "$_SHARED_SERVICES"
+}
+
+has_service() { # <service>
+    case " $(shared_services) " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# --- port allocation --------------------------------------------------------
+#
+# A port counts as unavailable if anything on the host is listening on it, or if
+# a running container has it published. Both checks run again at "up" time,
+# because a port free when the worktree was created may have been taken since.
+#
+# Note the limit: a *stopped* container reports no ports, so this cannot see a
+# project that is currently down. Detection protects you within a project; across
+# projects, give each one its own port band (see WORKTREE_APP_PORT_BASE above).
+
+port_listening_on_host() { # <port>
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+port_published_by_docker() { # <port>
+    docker ps -a --format '{{.Ports}}' 2>/dev/null | tr ',' '\n' | grep -q ":$1->"
+}
+
+port_published_by_project() { # <port> <project>
+    docker ps -a --format '{{.Ports}}' --filter "label=com.docker.compose.project=$2" \
+        2>/dev/null | tr ',' '\n' | grep -q ":$1->"
+}
+
+port_taken() { # <port>
+    port_listening_on_host "$1" || port_published_by_docker "$1"
+}
+
+port_claimed_by_another_env() { # <port> <key>
+    local port=$1 key=$2 f v
+    for f in "$MAIN_ENV" "$MAIN_ROOT"/.claude/worktrees/*/.env; do
+        [ -f "$f" ] || continue
+        [ "$f" != "$ENV_FILE" ] || continue
+        v=$(env_or "$f" "$key" "")
+        if [ "$v" = "$port" ]; then return 0; fi
+    done
+    return 1
+}
+
+alloc_port() { # <base> <key>
+    local p=$1 key=$2
+    while :; do
+        if port_claimed_by_another_env "$p" "$key" || port_taken "$p"; then
+            p=$((p + 1)); continue
+        fi
+        break
+    done
+    printf '%s' "$p"
+}
+
+# Keep <key> if it is still usable, otherwise move it to a free port.
+revalidate_port() { # <key> <base> <own project>
+    local key=$1 base=$2 project=$3 port fresh
+    port=$(env_or "$ENV_FILE" "$key" "")
+    if [ -n "$port" ]; then
+        if ! port_taken "$port"; then printf '%s' "$port"; return 0; fi
+        # Already published by our own container: that is this worktree's port.
+        if port_published_by_project "$port" "$project"; then printf '%s' "$port"; return 0; fi
+    fi
+    fresh=$(alloc_port "$base" "$key")
+    [ -z "$port" ] || warn "port $port is in use by something else; moving $key to $fresh"
+    env_set "$ENV_FILE" "$key" "$fresh"
+    printf '%s' "$fresh"
+}
+
+# --- docker helpers ---------------------------------------------------------
+
+compose_container() { # <project> <service>
+    docker ps -q \
+        --filter "label=com.docker.compose.project=$1" \
+        --filter "label=com.docker.compose.service=$2" | head -n 1
+}
+
+require_shared_services() { # <project>
+    local project=$1 svc missing=""
+    for svc in $(shared_services); do
+        [ -n "$(compose_container "$project" "$svc")" ] || missing="$missing $svc"
+    done
+    if [ -n "$missing" ]; then
+        info "starting shared services in the main checkout:$missing"
+        ( cd "$MAIN_ROOT" && ./vendor/bin/sail up -d $(shared_services) )
+    fi
+    docker network inspect "${project}_sail" >/dev/null 2>&1 \
+        || die "shared network '${project}_sail' is missing; run 'sail up -d' in $MAIN_ROOT first"
+}
+
+# Which engine the application's database lives on, and the Compose service that
+# holds it. sqlite has no service: its file sits inside the worktree, so it is
+# isolated already and there is nothing to create or drop.
+db_driver() { env_or "$MAIN_ENV" DB_CONNECTION pgsql; }
+
+db_service() {
+    case "$(db_driver)" in
+        pgsql)   printf 'pgsql' ;;
+        mysql)   printf 'mysql' ;;
+        mariadb) printf 'mariadb' ;;
+        mongodb) printf 'mongodb' ;;
+        *)       printf '' ;;
+    esac
+}
+
+wait_for_db() { # <container> <user> <password>
+    local i=0
+    while [ "$i" -lt 60 ]; do
+        case "$(db_driver)" in
+            pgsql)
+                docker exec "$1" pg_isready -q -U "$2" >/dev/null 2>&1 && return 0 ;;
+            mysql|mariadb)
+                docker exec "$1" mysqladmin ping -p"$3" --silent >/dev/null 2>&1 && return 0 ;;
+            mongodb)
+                docker exec "$1" mongosh --quiet --eval 'db.runCommand({ping:1})' \
+                    >/dev/null 2>&1 && return 0 ;;
+            *)  return 0 ;;
+        esac
+        sleep 1; i=$((i + 1))
+    done
+    return 1
+}
+
+ensure_database() { # <project> <user> <database>
+    local svc c pw driver
+    driver=$(db_driver); svc=$(db_service)
+    if [ -z "$svc" ]; then
+        info "DB_CONNECTION is '$driver'; no shared database server to prepare"
+        return 0
+    fi
+    c=$(compose_container "$1" "$svc")
+    [ -n "$c" ] || die "the shared '$svc' container is not running"
+    pw=$(env_or "$MAIN_ENV" DB_PASSWORD password)
+    wait_for_db "$c" "$2" "$pw" || die "$svc did not become ready in time"
+
+    case "$driver" in
+        pgsql)
+            if docker exec "$c" psql -U "$2" -d postgres -tAc \
+                    "SELECT 1 FROM pg_database WHERE datname = '$3'" 2>/dev/null | grep -q '^1$'; then
+                info "database '$3' already exists on the shared $svc"
+            else
+                docker exec "$c" psql -U "$2" -d postgres -q -c \
+                    "CREATE DATABASE \"$3\" OWNER \"$2\"" >/dev/null
+                info "created database '$3' on the shared $svc"
+            fi
+            ;;
+        mysql|mariadb)
+            # Fed over stdin so the backtick quoting MySQL needs survives intact.
+            if printf 'CREATE DATABASE IF NOT EXISTS `%s`;\nGRANT ALL ON `%s`.* TO %s;\n' \
+                    "$3" "$3" "'$2'@'%'" \
+                    | docker exec -i "$c" mysql -u root -p"$pw" >/dev/null 2>&1; then
+                info "database '$3' is present on the shared $svc"
+            else
+                warn "could not create database '$3' on $svc"
+            fi
+            ;;
+        mongodb)
+            info "mongodb creates '$3' on first write; nothing to prepare"
+            ;;
+    esac
+}
+
+drop_database() { # <project> <user> <database>
+    local svc c pw driver
+    driver=$(db_driver); svc=$(db_service)
+    [ -n "$svc" ] || return 0
+    c=$(compose_container "$1" "$svc")
+    if [ -z "$c" ]; then warn "$svc is not running; database '$3' was left in place"; return 0; fi
+    pw=$(env_or "$MAIN_ENV" DB_PASSWORD password)
+
+    case "$driver" in
+        pgsql)
+            if ! docker exec "$c" psql -U "$2" -d postgres -tAc \
+                    "SELECT 1 FROM pg_database WHERE datname = '$3'" 2>/dev/null | grep -q '^1$'; then
+                info "no database named '$3'; nothing to drop"
+                return 0
+            fi
+            docker exec "$c" psql -U "$2" -d postgres -q -c \
+                "DROP DATABASE IF EXISTS \"$3\" WITH (FORCE)" >/dev/null 2>&1 \
+                && info "dropped database '$3'" || warn "could not drop database '$3'"
+            ;;
+        mysql|mariadb)
+            printf 'DROP DATABASE IF EXISTS `%s`;\n' "$3" \
+                | docker exec -i "$c" mysql -u root -p"$pw" >/dev/null 2>&1 \
+                && info "dropped database '$3'" || warn "could not drop database '$3'"
+            ;;
+        mongodb)
+            docker exec "$c" mongosh --quiet "$3" --eval 'db.dropDatabase()' >/dev/null 2>&1 \
+                && info "dropped database '$3'" || warn "could not drop database '$3'"
+            ;;
+    esac
+}
+
+# Redis and Valkey are the same protocol; whichever the project installed, wipe
+# only the keys carrying this worktree's prefix.
+flush_kv_prefix() { # <project> <prefix>
+    local svc c cli count
+    [ -n "$2" ] || return 0
+    for svc in redis valkey; do
+        has_service "$svc" || continue
+        c=$(compose_container "$1" "$svc")
+        [ -n "$c" ] || continue
+        cli=$(docker exec "$c" sh -c 'command -v valkey-cli || command -v redis-cli' 2>/dev/null | head -1)
+        [ -n "$cli" ] || continue
+        count=$(docker exec "$c" sh -c "$cli --scan --pattern '$2*' | wc -l" 2>/dev/null | tr -d ' ')
+        [ -n "$count" ] && [ "$count" != "0" ] || continue
+        docker exec "$c" sh -c \
+            "$cli --scan --pattern '$2*' | xargs -n 100 $cli DEL >/dev/null" 2>/dev/null \
+            && info "flushed $count $svc key(s) matching '$2*'" || true
+    done
+}
+
+wait_for_container() { # <project> <service>
+    local i=0
+    while [ "$i" -lt 60 ]; do
+        [ -n "$(compose_container "$1" "$2")" ] && return 0
+        sleep 1; i=$((i + 1))
+    done
+    return 1
+}
+
+wait_for_http() { # <port>
+    local i=0
+    while [ "$i" -lt 90 ]; do
+        curl -sfo /dev/null "http://localhost:$1" && return 0
+        sleep 1; i=$((i + 1))
+    done
+    return 1
+}
+
+# Remove every Docker object Compose created for a worktree's project. The
+# shared network and the shared pgsql/redis volumes carry the *main* project's
+# labels, so they are never selected here; the guard below makes that explicit.
+sweep_docker_project() { # <project>
+    local project=$1 ids
+    [ -n "$project" ] || return 0
+    if [ "$project" = "$(detect_main_project)" ]; then
+        warn "refusing to sweep '$project': that is the main checkout's project"
+        return 0
+    fi
+
+    ids=$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)
+    if [ -n "$ids" ]; then
+        docker rm -f $ids >/dev/null 2>&1 || true
+        info "removed containers for project '$project'"
+    fi
+    ids=$(docker network ls -q --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)
+    if [ -n "$ids" ]; then
+        docker network rm $ids >/dev/null 2>&1 || true
+        info "removed networks for project '$project'"
+    fi
+    ids=$(docker volume ls -q --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)
+    if [ -n "$ids" ]; then
+        docker volume rm -f $ids >/dev/null 2>&1 || true
+        info "removed volumes for project '$project'"
+    fi
+}
+
+# --- commands ---------------------------------------------------------------
+
+assert_worktree() {
+    [ "$WORKTREE_ROOT" != "$MAIN_ROOT" ] || die \
+        "this is the main checkout; it runs the stock Sail stack with 'sail up -d'"
+}
+
+cmd_init() {
+    assert_worktree
+
+    local project slug slug_ mainport mainvite app_port vite_port db own
+
+    project=$(detect_main_project)
+    slug=$(slugify "$(basename "$WORKTREE_ROOT")")
+    slug_=$(printf '%s' "$slug" | tr '-' '_')
+    own="${project}-${slug}"
+
+    if [ ! -f "$ENV_FILE" ]; then
+        [ -f "$MAIN_ENV" ] || die "no .env in the worktree and none in $MAIN_ROOT to copy"
+        warn ".env was not carried over; copying it from the main checkout"
+        cp "$MAIN_ENV" "$ENV_FILE"
+    fi
+
+    # A freshly-copied .env still holds the main checkout's ports, so a value
+    # equal to those (or missing) means "not yet allocated for this worktree".
+    mainport=$(env_or "$MAIN_ENV" APP_PORT 80)
+    mainvite=$(env_or "$MAIN_ENV" VITE_PORT 5173)
+    app_port=$(env_or "$ENV_FILE" APP_PORT "")
+    vite_port=$(env_or "$ENV_FILE" VITE_PORT "")
+    if [ -z "$app_port" ] || [ "$app_port" = "$mainport" ]; then
+        env_set "$ENV_FILE" APP_PORT "$(alloc_port "$APP_PORT_BASE" APP_PORT)"
+    fi
+    if [ -z "$vite_port" ] || [ "$vite_port" = "$mainvite" ]; then
+        env_set "$ENV_FILE" VITE_PORT "$(alloc_port "$VITE_PORT_BASE" VITE_PORT)"
+    fi
+    # Re-check against the live system, in case the port was taken since.
+    app_port=$(revalidate_port APP_PORT  "$APP_PORT_BASE"  "$own")
+    vite_port=$(revalidate_port VITE_PORT "$VITE_PORT_BASE" "$own")
+
+    db=$(worktree_database "$WORKTREE_ROOT")
+
+    # Point Sail at the worktree-only Compose file and at the main project's
+    # network. Because SAIL_FILES makes Sail pass an explicit -f, compose.yaml is
+    # not loaded here at all, so pgsql/redis/mailpit are never duplicated.
+    env_set "$ENV_FILE" SAIL_FILES           "compose.worktree.yaml"
+    env_set "$ENV_FILE" SAIL_SHARED_NETWORK  "${project}_sail"
+    env_set "$ENV_FILE" COMPOSE_PROJECT_NAME "$own"
+
+    env_set "$ENV_FILE" APP_URL "http://localhost:${app_port}"
+
+    # Same Postgres server, own database. Same Redis, own key namespace.
+    env_set "$ENV_FILE" DB_DATABASE  "$db"
+    env_set "$ENV_FILE" REDIS_PREFIX "${slug_}_database_"
+    env_set "$ENV_FILE" CACHE_PREFIX "${slug_}_cache_"
+
+    # The remaining stateful services get a namespace of their own, so two
+    # checkouts sharing one server do not share indexes, buckets or queues.
+    # Written only when the service is actually installed, to keep .env honest.
+    if has_service meilisearch || has_service typesense; then
+        env_set "$ENV_FILE" SCOUT_PREFIX "${slug_}_"
+    fi
+    if has_service minio || has_service rustfs; then
+        # Bucket names allow lowercase and hyphens only, which is what slug is.
+        env_set "$ENV_FILE" AWS_BUCKET "$slug"
+    fi
+    if has_service rabbitmq; then
+        env_set "$ENV_FILE" RABBITMQ_QUEUE "${slug_}_default"
+    fi
+
+    write_testing_env "$WORKTREE_ROOT" >/dev/null
+
+    info "configured worktree ${BOLD}${slug}${NC}"
+    printf '    compose project : %s\n' "$own"
+    printf '    shared network  : %s\n' "${project}_sail"
+    printf '    app             : http://localhost:%s\n' "$app_port"
+    printf '    vite            : %s\n' "$vite_port"
+    printf '    database        : %s\n' "$db"
+    printf '    test database   : %s\n' "$(testing_database_for "$WORKTREE_ROOT")"
+    printf '    shares          : %s\n' "$(shared_services)"
+}
+
+# Regenerate .env.testing for whichever checkout you are standing in. Unlike the
+# other commands this one also works in the main checkout, which needs the file
+# for the same reason a worktree does.
+cmd_testing_env() {
+    local db
+    db=$(write_testing_env "$WORKTREE_ROOT")
+    info "wrote .env.testing for $(basename "$WORKTREE_ROOT") -> database '$db'"
+}
+
+# Everything `up` does except starting the container: give this worktree its own
+# identity, make sure the shared services are running, and make sure its database
+# exists. ./sail calls this before handing a command to Sail in a worktree that
+# has not been configured yet.
+cmd_prepare() {
+    assert_worktree
+    cmd_init
+
+    local project
+    project=$(detect_main_project)
+    require_shared_services "$project"
+    ensure_database "$project" \
+        "$(env_or "$ENV_FILE" DB_USERNAME sail)" "$(env_or "$ENV_FILE" DB_DATABASE laravel)"
+    ensure_database "$project" \
+        "$(env_or "$ENV_FILE" DB_USERNAME sail)" "$(testing_database_for "$WORKTREE_ROOT")"
+}
+
+cmd_up() {
+    assert_worktree
+    cmd_prepare
+
+    local app_port
+
+    info "starting this worktree's application container"
+    ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail up -d )
+    wait_for_container "$(resolve_project "$WORKTREE_ROOT")" laravel.test \
+        || die "the application container did not start"
+
+    # Migrate before probing HTTP: the session driver is "database", so every
+    # request 500s until the schema exists.
+    ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail artisan migrate --force )
+
+    app_port=$(env_or "$ENV_FILE" APP_PORT 80)
+    wait_for_http "$app_port" \
+        || warn "http://localhost:$app_port has not answered yet"
+
+    info "worktree is up on ${BOLD}http://localhost:${app_port}${NC}"
+}
+
+cmd_down() {
+    assert_worktree
+    if worktree_is_configured "$WORKTREE_ROOT"; then
+        ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail down --remove-orphans ) || true
+    else
+        warn "this worktree's .env has not been configured yet; not invoking Sail"
+    fi
+    sweep_docker_project "$(resolve_project "$WORKTREE_ROOT")"
+}
+
+# Everything cmd_down does, plus the state this worktree kept on the shared
+# services: its database and its Redis keys.
+teardown() { # <worktree path>
+    local path=$1 env project main_project
+    env="$path/.env"
+    main_project=$(detect_main_project)
+    project=$(resolve_project "$path")
+
+    if [ -x "$path/vendor/bin/sail" ] && worktree_is_configured "$path"; then
+        ( cd "$path" && ./vendor/bin/sail down --remove-orphans --volumes ) >/dev/null 2>&1 || true
+    fi
+    # Label-based sweep, which is scoped to this worktree's project by construction.
+    sweep_docker_project "$project"
+
+    # Prefer the worktree's own .env; fall back to what cmd_init would have
+    # derived, so this still works when the directory has already been removed.
+    local db prefix
+    db=$(env_or "$env" DB_DATABASE "")
+    [ -n "$db" ] || db=$(worktree_database "$path")
+
+    # A worktree whose .env was never rewritten still names the main checkout's
+    # database. That one must never be dropped here.
+    if [ "$db" != "$(env_or "$MAIN_ENV" DB_DATABASE laravel)" ]; then
+        drop_database "$main_project" "$(env_or "$env" DB_USERNAME sail)" "$db"
+    else
+        warn "left database '$db' alone: it is the main checkout's own database"
+    fi
+
+    local tdb
+    tdb=$(testing_database_for "$path")
+    if [ "$tdb" != "$(testing_database_for "$MAIN_ROOT")" ]; then
+        drop_database "$main_project" "$(env_or "$env" DB_USERNAME sail)" "$tdb"
+    else
+        warn "left database '$tdb' alone: it is the main checkout's test database"
+    fi
+
+    for prefix in \
+        "$(env_or "$env" REDIS_PREFIX "$(worktree_slug "$path")_database_")" \
+        "$(env_or "$env" CACHE_PREFIX "$(worktree_slug "$path")_cache_")"; do
+        [ -n "$prefix" ] || continue
+        [ "$prefix" != "$(env_or "$MAIN_ENV" REDIS_PREFIX "")" ] || continue
+        [ "$prefix" != "$(env_or "$MAIN_ENV" CACHE_PREFIX "")" ] || continue
+        flush_kv_prefix "$main_project" "$prefix"
+    done
+}
+
+# Tear down a worktree's Docker and database state without touching git. This is
+# what the WorktreeRemove hook calls: Claude Code removes the worktree itself, so
+# by the time this runs the directory may already be gone.
+cmd_teardown() {
+    local path=${1:-}
+    [ -n "$path" ] || die "usage: worktree-sail teardown <worktree path>"
+    case "$path" in /*) ;; *) path="$MAIN_ROOT/$path" ;; esac
+    path=${path%/}
+    [ ! -d "$path" ] || path=$(cd "$path" && pwd -P)
+    [ "$path" != "$MAIN_ROOT" ] || die "refusing to tear down the main checkout"
+    teardown "$path"
+    info "cleaned up docker and database state for $(basename "$path")"
+}
+
+cmd_destroy() {
+    assert_worktree
+    teardown "$WORKTREE_ROOT"
+    info "docker and database state for this worktree is gone; the files remain"
+}
+
+cmd_remove() {
+    local name=${1:-} drop_branch=${2:-} dir
+    [ -n "$name" ] || die "usage: worktree-sail remove <name> [--branch]"
+    dir="$MAIN_ROOT/.claude/worktrees/$name"
+    [ -d "$dir" ] || die "no worktree at $dir"
+    [ "$dir" != "$WORKTREE_ROOT" ] || die "run this from the main checkout, not from inside $name"
+
+    local branch
+    branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+
+    teardown "$dir"
+    git -C "$MAIN_ROOT" worktree remove --force "$dir"
+    info "removed worktree $name"
+
+    if [ "$drop_branch" = "--branch" ] && [ -n "$branch" ] && [ "$branch" != "HEAD" ]; then
+        git -C "$MAIN_ROOT" branch -D "$branch" >/dev/null && info "deleted branch $branch"
+    fi
+}
+
+cmd_status() {
+    local project path branch env app_port db state svc cid
+    project=$(detect_main_project)
+
+    printf '%sshared services%s  (compose project %s)\n' "$BOLD" "$NC" "$project"
+    for svc in $(shared_services); do
+        cid=$(compose_container "$project" "$svc")
+        if [ -n "$cid" ]; then
+            printf '    %-8s up    %s\n' "$svc" \
+                "$(docker ps --format '{{.Ports}}' --filter "id=$cid" | head -n1)"
+        else
+            printf '    %-8s down\n' "$svc"
+        fi
+    done
+
+    printf '\n%s%-24s %-20s %-6s %-5s %s%s\n' "$BOLD" "worktree" "branch" "port" "state" "database" "$NC"
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+        env="$path/.env"
+        app_port=$(env_or "$env" APP_PORT "-")
+        db=$(env_or "$env" DB_DATABASE "-")
+        if [ "$path" = "$MAIN_ROOT" ]; then
+            cid=$(compose_container "$project" laravel.test)
+        else
+            cid=$(compose_container "$(resolve_project "$path")" laravel.test)
+        fi
+        [ -n "$cid" ] && state=up || state=down
+        printf '    %-24s %-20s %-6s %-5s %s\n' \
+            "$([ "$path" = "$MAIN_ROOT" ] && echo '(main checkout)' || basename "$path")" \
+            "$branch" "$app_port" "$state" "$db"
+    done < <(git -C "$MAIN_ROOT" worktree list --porcelain | awk '/^worktree /{print substr($0,10)}')
+}
+
+# Mirrors what Claude Code does with .worktreeinclude, for worktrees created by
+# hand. `git ls-files --others --ignored --exclude-from=<file>` lists exactly the
+# untracked entries those patterns select.
+copy_includes() { # <destination>
+    local dest=$1 entry src
+    [ -f "$MAIN_ROOT/.worktreeinclude" ] || return 0
+    while IFS= read -r entry; do
+        entry=${entry%/}
+        [ -n "$entry" ] || continue
+        src="$MAIN_ROOT/$entry"
+        [ -e "$src" ] || continue
+        if [ -L "$src" ]; then continue; fi
+        mkdir -p "$dest/$(dirname "$entry")"
+        # -c clones on APFS: near-instant, and costs no extra disk space.
+        cp -Rc "$src" "$dest/$entry" 2>/dev/null || cp -R "$src" "$dest/$entry"
+        info "copied $entry"
+    done < <(cd "$MAIN_ROOT" && git ls-files --others --ignored --directory \
+                 --exclude-from=.worktreeinclude)
+}
+
+cmd_create() {
+    local name=${1:-} base=${2:-main} dir
+    [ -n "$name" ] || die "usage: worktree-sail create <branch> [base]"
+    dir="$MAIN_ROOT/.claude/worktrees/$name"
+    [ ! -e "$dir" ] || die "$dir already exists"
+    git -C "$MAIN_ROOT" worktree add -b "$name" "$dir" "$base"
+    copy_includes "$dir"
+    # Run it from inside the new worktree: the script resolves which worktree it
+    # is acting on from the working directory, not from its own path.
+    ( cd "$dir" && ./bin/worktree-sail up )
+}
+
+case "${1:-}" in
+    init)    shift; cmd_init "$@" ;;
+    testing-env) shift; cmd_testing_env "$@" ;;
+    prepare) shift; cmd_prepare "$@" ;;
+    up)      shift; cmd_up "$@" ;;
+    down)    shift; cmd_down "$@" ;;
+    destroy) shift; cmd_destroy "$@" ;;
+    teardown) shift; cmd_teardown "$@" ;;
+    status)  shift; cmd_status "$@" ;;
+    create)  shift; cmd_create "$@" ;;
+    remove)  shift; cmd_remove "$@" ;;
+    *)       sed -n '3,32p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'; exit 1 ;;
+esac

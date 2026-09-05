@@ -115,6 +115,20 @@ See [Running more than one project](docs/worktree-isolation.md#running-more-than
 
 The main checkout stays plain Sail: `sail up -d`, `sail down`, `sail test`.
 
+## Installing this into your own project
+
+There's a Claude Code skill that does the whole install — working out a free port
+band, copying the files, patching `phpunit.xml` and `tests/TestCase.php`, and
+booting a throwaway worktree to prove it before reporting success:
+
+```bash
+cp -R skills/laravel-sail-worktrees ~/.claude/skills/
+```
+
+Then ask Claude, from your own Sail project, to set it up so each branch gets its
+own environment. See [skills/README.md](skills/README.md). Prefer to do it by
+hand? The tutorial below is the same procedure, written out.
+
 ## Documentation
 
 - **[docs/building-it-from-scratch.md](docs/building-it-from-scratch.md)** — build
