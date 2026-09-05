@@ -28,4 +28,4 @@ services:
 networks:
     sail:
         external: true
-        name: '${SAIL_SHARED_NETWORK:-learn-worktrees_sail}'
+        name: '${SAIL_SHARED_NETWORK:-laravel-worktrees_sail}'

@@ -17,7 +17,7 @@ that matters: **processes are shared, state is not.**
                      └────────┬─────────┘             └────────┬─────────┘
                               │                                │
                               └──────────┬─────────────────────┘
-                                         │  network: learn-worktrees_sail
+                                         │  network: laravel-worktrees_sail
                         ┌────────────────┼────────────────┐
                         │                │                │
                    ┌────┴────┐      ┌────┴────┐      ┌────┴────┐
@@ -110,7 +110,7 @@ than building its own.
 networks:
     sail:
         external: true
-        name: '${SAIL_SHARED_NETWORK:-learn-worktrees_sail}'
+        name: '${SAIL_SHARED_NETWORK:-laravel-worktrees_sail}'
 ```
 
 Joining the main project's network is what makes the hostnames `pgsql`, `redis`
@@ -118,7 +118,7 @@ and `mailpit` resolve inside a worktree's container. `external: true` also means
 Compose will never delete it during a worktree teardown.
 
 The main checkout's project name is pinned in its `.env`
-(`COMPOSE_PROJECT_NAME=learn-worktrees`) so the network name is predictable.
+(`COMPOSE_PROJECT_NAME=laravel-worktrees`) so the network name is predictable.
 
 ### 4. `.env` carries everything else
 
@@ -127,8 +127,8 @@ The main checkout's project name is pinned in its `.env`
 | Variable | Purpose | Example |
 | --- | --- | --- |
 | `SAIL_FILES` | selects the worktree Compose file | `compose.worktree.yaml` |
-| `SAIL_SHARED_NETWORK` | which network to join | `learn-worktrees_sail` |
-| `COMPOSE_PROJECT_NAME` | separates the Compose project | `learn-worktrees-feature-x` |
+| `SAIL_SHARED_NETWORK` | which network to join | `laravel-worktrees_sail` |
+| `COMPOSE_PROJECT_NAME` | separates the Compose project | `laravel-worktrees-feature-x` |
 | `APP_PORT` / `VITE_PORT` | separates the published ports | `8001` / `5174` |
 | `APP_URL` | matches the port | `http://localhost:8001` |
 | `DB_DATABASE` | own database on the shared server | `laravel_feature_x` |
@@ -322,7 +322,7 @@ Everything flows from `compose.yaml`, so treat it as the single source of truth:
 
 ## Troubleshooting
 
-**`shared network 'learn-worktrees_sail' is missing`** — the main checkout is
+**`shared network 'laravel-worktrees_sail' is missing`** — the main checkout is
 down. Run `sail up -d` there first; the worktrees depend on its services.
 
 **A worktree's page returns 500** — its database has no schema yet. Run

@@ -66,7 +66,7 @@ so make it predictable rather than a function of what the folder is called. Add
 to **`.env`** (not `.env.example` — this is per-machine):
 
 ```dotenv
-COMPOSE_PROJECT_NAME=learn-worktrees
+COMPOSE_PROJECT_NAME=laravel-worktrees
 APP_PORT=80
 VITE_PORT=5173
 ```
@@ -75,8 +75,8 @@ Compose reads `COMPOSE_PROJECT_NAME` out of `.env` itself, so nothing else has t
 pass it. Prove it:
 
 ```bash
-docker compose config | head -1        # name: learn-worktrees
-docker network ls | grep sail          # learn-worktrees_sail
+docker compose config | head -1        # name: laravel-worktrees
+docker network ls | grep sail          # laravel-worktrees_sail
 ```
 
 `APP_PORT`/`VITE_PORT` are already the defaults; writing them down explicitly
@@ -168,7 +168,7 @@ services:
 networks:
     sail:
         external: true
-        name: '${SAIL_SHARED_NETWORK:-learn-worktrees_sail}'
+        name: '${SAIL_SHARED_NETWORK:-laravel-worktrees_sail}'
 ```
 
 Four things are happening:
@@ -305,8 +305,8 @@ Every line below exists for a reason:
 
 ```dotenv
 SAIL_FILES=compose.worktree.yaml              # use the worktree Compose file
-SAIL_SHARED_NETWORK=learn-worktrees_sail      # attach to the main project's network
-COMPOSE_PROJECT_NAME=learn-worktrees-feature-x # separate Compose project → separate containers
+SAIL_SHARED_NETWORK=laravel-worktrees_sail      # attach to the main project's network
+COMPOSE_PROJECT_NAME=laravel-worktrees-feature-x # separate Compose project → separate containers
 APP_PORT=8001                                 # separate published ports
 VITE_PORT=5174
 APP_URL=http://localhost:8001                 # so generated URLs match
@@ -329,7 +329,7 @@ network.
 The database does not exist yet. Create it on the shared server:
 
 ```bash
-docker exec learn-worktrees-pgsql-1 \
+docker exec laravel-worktrees-pgsql-1 \
   psql -U sail -d postgres -c 'CREATE DATABASE "laravel_feature_x" OWNER "sail"'
 ```
 
@@ -439,7 +439,7 @@ not be a week later.
 path, or it configures whichever worktree you happened to be standing in.
 
 **A copied `.env` is dangerous until it is rewritten.** It still says
-`COMPOSE_PROJECT_NAME=learn-worktrees` with no `SAIL_FILES`. Run
+`COMPOSE_PROJECT_NAME=laravel-worktrees` with no `SAIL_FILES`. Run
 `sail down --volumes` against that from a worktree and Compose resolves the
 **main** project — deleting the main checkout's containers *and* its Postgres
 volume. This repo did exactly that once. Three guards now prevent it:
