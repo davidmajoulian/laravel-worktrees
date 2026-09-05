@@ -28,6 +28,8 @@
 # And from anywhere in the repository:
 #   worktree-sail create <branch> [base]   git worktree add + copy + up
 #   worktree-sail remove <name> [--branch] destroy everything, then drop the worktree
+#   worktree-sail teardown <path>          docker/database cleanup only, no git;
+#                                          this is what the WorktreeRemove hook calls
 
 set -euo pipefail
 
@@ -127,6 +129,19 @@ worktree_is_configured() { # <worktree path>
     [ "$(env_or "$env" SAIL_FILES "")" = "compose.worktree.yaml" ] || return 1
     [ "$(env_or "$env" COMPOSE_PROJECT_NAME "")" != "$(detect_main_project)" ] || return 1
     return 0
+}
+
+# The database and key prefixes a worktree owns, derived from its directory name
+# exactly as cmd_init derives them. Teardown needs these because the
+# WorktreeRemove hook can fire once the worktree directory is already gone,
+# taking its .env with it.
+worktree_slug() { # <worktree path>
+    slugify "$(basename "$1")" | tr '-' '_'
+}
+
+worktree_database() { # <worktree path>
+    printf '%s_%s' "$(env_or "$MAIN_ENV" DB_DATABASE laravel)" "$(worktree_slug "$1")" \
+        | cut -c1-63
 }
 
 # The Compose project a worktree owns. A worktree whose .env was copied but never
@@ -251,6 +266,11 @@ drop_database() { # <project> <user> <database>
     local pg
     pg=$(compose_container "$1" pgsql)
     if [ -z "$pg" ]; then warn "pgsql is not running; database '$3' was left in place"; return 0; fi
+    if ! docker exec "$pg" psql -U "$2" -d postgres -tAc \
+            "SELECT 1 FROM pg_database WHERE datname = '$3'" 2>/dev/null | grep -q '^1$'; then
+        info "no database named '$3'; nothing to drop"
+        return 0
+    fi
     docker exec "$pg" psql -U "$2" -d postgres -q -c \
         "DROP DATABASE IF EXISTS \"$3\" WITH (FORCE)" >/dev/null 2>&1 \
         && info "dropped database '$3'" \
@@ -262,9 +282,12 @@ flush_redis_prefix() { # <project> <prefix>
     [ -n "$2" ] || return 0
     rd=$(compose_container "$1" redis)
     [ -n "$rd" ] || return 0
+    local count
+    count=$(docker exec "$rd" sh -c "redis-cli --scan --pattern '$2*' | wc -l" 2>/dev/null | tr -d ' ')
+    if [ -z "$count" ] || [ "$count" = "0" ]; then return 0; fi
     docker exec "$rd" sh -c \
-        "redis-cli --scan --pattern '$2*' | xargs -r -n 100 redis-cli DEL >/dev/null" 2>/dev/null \
-        && info "flushed redis keys matching '$2*'" || true
+        "redis-cli --scan --pattern '$2*' | xargs -n 100 redis-cli DEL >/dev/null" 2>/dev/null \
+        && info "flushed $count redis key(s) matching '$2*'" || true
 }
 
 wait_for_container() { # <project> <service>
@@ -323,7 +346,7 @@ assert_worktree() {
 cmd_init() {
     assert_worktree
 
-    local project slug slug_ mainport mainvite app_port vite_port db main_db own
+    local project slug slug_ mainport mainvite app_port vite_port db own
 
     project=$(detect_main_project)
     slug=$(slugify "$(basename "$WORKTREE_ROOT")")
@@ -352,8 +375,7 @@ cmd_init() {
     app_port=$(revalidate_port APP_PORT  "$APP_PORT_BASE"  "$own")
     vite_port=$(revalidate_port VITE_PORT "$VITE_PORT_BASE" "$own")
 
-    main_db=$(env_or "$MAIN_ENV" DB_DATABASE laravel)
-    db=$(printf '%s_%s' "$main_db" "$slug_" | cut -c1-63)
+    db=$(worktree_database "$WORKTREE_ROOT")
 
     # Point Sail at the worktree-only Compose file and at the main project's
     # network. Because SAIL_FILES makes Sail pass an explicit -f, compose.yaml is
@@ -438,24 +460,42 @@ teardown() { # <worktree path>
     # Label-based sweep, which is scoped to this worktree's project by construction.
     sweep_docker_project "$project"
 
-    if [ -f "$env" ]; then
-        # A worktree whose .env was never rewritten still points at the main
-        # checkout's database and prefixes. Those must never be deleted here.
-        local db main_db prefix
-        db=$(env_or "$env" DB_DATABASE "")
-        main_db=$(env_or "$MAIN_ENV" DB_DATABASE laravel)
-        if [ -n "$db" ] && [ "$db" != "$main_db" ]; then
-            drop_database "$main_project" "$(env_or "$env" DB_USERNAME sail)" "$db"
-        else
-            warn "left database '$db' alone: it is the main checkout's own database"
-        fi
-        for prefix in "$(env_or "$env" REDIS_PREFIX "")" "$(env_or "$env" CACHE_PREFIX "")"; do
-            [ -n "$prefix" ] || continue
-            [ "$prefix" != "$(env_or "$MAIN_ENV" REDIS_PREFIX "")" ] || continue
-            [ "$prefix" != "$(env_or "$MAIN_ENV" CACHE_PREFIX "")" ] || continue
-            flush_redis_prefix "$main_project" "$prefix"
-        done
+    # Prefer the worktree's own .env; fall back to what cmd_init would have
+    # derived, so this still works when the directory has already been removed.
+    local db prefix
+    db=$(env_or "$env" DB_DATABASE "")
+    [ -n "$db" ] || db=$(worktree_database "$path")
+
+    # A worktree whose .env was never rewritten still names the main checkout's
+    # database. That one must never be dropped here.
+    if [ "$db" != "$(env_or "$MAIN_ENV" DB_DATABASE laravel)" ]; then
+        drop_database "$main_project" "$(env_or "$env" DB_USERNAME sail)" "$db"
+    else
+        warn "left database '$db' alone: it is the main checkout's own database"
     fi
+
+    for prefix in \
+        "$(env_or "$env" REDIS_PREFIX "$(worktree_slug "$path")_database_")" \
+        "$(env_or "$env" CACHE_PREFIX "$(worktree_slug "$path")_cache_")"; do
+        [ -n "$prefix" ] || continue
+        [ "$prefix" != "$(env_or "$MAIN_ENV" REDIS_PREFIX "")" ] || continue
+        [ "$prefix" != "$(env_or "$MAIN_ENV" CACHE_PREFIX "")" ] || continue
+        flush_redis_prefix "$main_project" "$prefix"
+    done
+}
+
+# Tear down a worktree's Docker and database state without touching git. This is
+# what the WorktreeRemove hook calls: Claude Code removes the worktree itself, so
+# by the time this runs the directory may already be gone.
+cmd_teardown() {
+    local path=${1:-}
+    [ -n "$path" ] || die "usage: worktree-sail teardown <worktree path>"
+    case "$path" in /*) ;; *) path="$MAIN_ROOT/$path" ;; esac
+    path=${path%/}
+    [ ! -d "$path" ] || path=$(cd "$path" && pwd -P)
+    [ "$path" != "$MAIN_ROOT" ] || die "refusing to tear down the main checkout"
+    teardown "$path"
+    info "cleaned up docker and database state for $(basename "$path")"
 }
 
 cmd_destroy() {
@@ -555,6 +595,7 @@ case "${1:-}" in
     up)      shift; cmd_up "$@" ;;
     down)    shift; cmd_down "$@" ;;
     destroy) shift; cmd_destroy "$@" ;;
+    teardown) shift; cmd_teardown "$@" ;;
     status)  shift; cmd_status "$@" ;;
     create)  shift; cmd_create "$@" ;;
     remove)  shift; cmd_remove "$@" ;;
