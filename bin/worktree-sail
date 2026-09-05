@@ -34,9 +34,6 @@
 
 set -euo pipefail
 
-APP_PORT_BASE=8001
-VITE_PORT_BASE=5174
-SHARED_SERVICES="pgsql redis mailpit"
 
 if [ -t 1 ]; then
     BOLD=$(tput bold 2>/dev/null || true); RED=$(tput setaf 1 2>/dev/null || true)
@@ -183,12 +180,52 @@ resolve_project() { # <worktree path>
     printf '%s' "$project"
 }
 
+# --- per-project configuration ----------------------------------------------
+#
+# Two projects on one machine must not hand their worktrees the same ports. Give
+# each project its own band from the main checkout's .env:
+#
+#     WORKTREE_APP_PORT_BASE=8101
+#     WORKTREE_VITE_PORT_BASE=5274
+#
+# and move the shared services' published ports out of the way with Sail's own
+# FORWARD_* variables. See docs/worktree-isolation.md, "Running more than one
+# project", for a worked band.
+APP_PORT_BASE=$(env_or "$MAIN_ENV" WORKTREE_APP_PORT_BASE 8001)
+VITE_PORT_BASE=$(env_or "$MAIN_ENV" WORKTREE_VITE_PORT_BASE 5174)
+APP_SERVICE=$(env_or "$MAIN_ENV" APP_SERVICE laravel.test)
+
+# Every service the main checkout's compose.yaml defines except the application
+# itself. Derived rather than listed, so whatever `sail:install --with=...` put
+# there -- mysql, valkey, meilisearch, minio, rabbitmq -- is handled without
+# editing this script.
+_SHARED_SERVICES=""
+shared_services() {
+    if [ -z "$_SHARED_SERVICES" ]; then
+        _SHARED_SERVICES=$(
+            cd "$MAIN_ROOT" \
+                && WWWUSER="${WWWUSER:-$(id -u)}" WWWGROUP="${WWWGROUP:-$(id -g)}" \
+                   docker compose config --services 2>/dev/null \
+                | grep -v "^${APP_SERVICE}$" | sort | tr '\n' ' '
+        )
+    fi
+    printf '%s' "$_SHARED_SERVICES"
+}
+
+has_service() { # <service>
+    case " $(shared_services) " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
 # --- port allocation --------------------------------------------------------
 #
 # A port counts as unavailable if anything on the host is listening on it, or if
-# any container -- running or stopped, from this project or any other -- has it
-# published. Both checks run again at "up" time, because a port that was free
-# when the worktree was created may have been taken since.
+# a running container has it published. Both checks run again at "up" time,
+# because a port free when the worktree was created may have been taken since.
+#
+# Note the limit: a *stopped* container reports no ports, so this cannot see a
+# project that is currently down. Detection protects you within a project; across
+# projects, give each one its own port band (see WORKTREE_APP_PORT_BASE above).
 
 port_listening_on_host() { # <port>
     lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
@@ -254,67 +291,137 @@ compose_container() { # <project> <service>
 
 require_shared_services() { # <project>
     local project=$1 svc missing=""
-    for svc in $SHARED_SERVICES; do
+    for svc in $(shared_services); do
         [ -n "$(compose_container "$project" "$svc")" ] || missing="$missing $svc"
     done
     if [ -n "$missing" ]; then
         info "starting shared services in the main checkout:$missing"
-        ( cd "$MAIN_ROOT" && ./vendor/bin/sail up -d $SHARED_SERVICES )
+        ( cd "$MAIN_ROOT" && ./vendor/bin/sail up -d $(shared_services) )
     fi
     docker network inspect "${project}_sail" >/dev/null 2>&1 \
         || die "shared network '${project}_sail' is missing; run 'sail up -d' in $MAIN_ROOT first"
 }
 
-wait_for_pgsql() { # <container> <user>
+# Which engine the application's database lives on, and the Compose service that
+# holds it. sqlite has no service: its file sits inside the worktree, so it is
+# isolated already and there is nothing to create or drop.
+db_driver() { env_or "$MAIN_ENV" DB_CONNECTION pgsql; }
+
+db_service() {
+    case "$(db_driver)" in
+        pgsql)   printf 'pgsql' ;;
+        mysql)   printf 'mysql' ;;
+        mariadb) printf 'mariadb' ;;
+        mongodb) printf 'mongodb' ;;
+        *)       printf '' ;;
+    esac
+}
+
+wait_for_db() { # <container> <user> <password>
     local i=0
     while [ "$i" -lt 60 ]; do
-        docker exec "$1" pg_isready -q -U "$2" >/dev/null 2>&1 && return 0
+        case "$(db_driver)" in
+            pgsql)
+                docker exec "$1" pg_isready -q -U "$2" >/dev/null 2>&1 && return 0 ;;
+            mysql|mariadb)
+                docker exec "$1" mysqladmin ping -p"$3" --silent >/dev/null 2>&1 && return 0 ;;
+            mongodb)
+                docker exec "$1" mongosh --quiet --eval 'db.runCommand({ping:1})' \
+                    >/dev/null 2>&1 && return 0 ;;
+            *)  return 0 ;;
+        esac
         sleep 1; i=$((i + 1))
     done
     return 1
 }
 
 ensure_database() { # <project> <user> <database>
-    local pg
-    pg=$(compose_container "$1" pgsql)
-    [ -n "$pg" ] || die "the shared 'pgsql' container is not running"
-    wait_for_pgsql "$pg" "$2" || die "postgres did not become ready in time"
-    if docker exec "$pg" psql -U "$2" -d postgres -tAc \
-            "SELECT 1 FROM pg_database WHERE datname = '$3'" 2>/dev/null | grep -q '^1$'; then
-        info "database '$3' already exists on the shared postgres"
-    else
-        docker exec "$pg" psql -U "$2" -d postgres -q -c \
-            "CREATE DATABASE \"$3\" OWNER \"$2\"" >/dev/null
-        info "created database '$3' on the shared postgres"
+    local svc c pw driver
+    driver=$(db_driver); svc=$(db_service)
+    if [ -z "$svc" ]; then
+        info "DB_CONNECTION is '$driver'; no shared database server to prepare"
+        return 0
     fi
+    c=$(compose_container "$1" "$svc")
+    [ -n "$c" ] || die "the shared '$svc' container is not running"
+    pw=$(env_or "$MAIN_ENV" DB_PASSWORD password)
+    wait_for_db "$c" "$2" "$pw" || die "$svc did not become ready in time"
+
+    case "$driver" in
+        pgsql)
+            if docker exec "$c" psql -U "$2" -d postgres -tAc \
+                    "SELECT 1 FROM pg_database WHERE datname = '$3'" 2>/dev/null | grep -q '^1$'; then
+                info "database '$3' already exists on the shared $svc"
+            else
+                docker exec "$c" psql -U "$2" -d postgres -q -c \
+                    "CREATE DATABASE \"$3\" OWNER \"$2\"" >/dev/null
+                info "created database '$3' on the shared $svc"
+            fi
+            ;;
+        mysql|mariadb)
+            # Fed over stdin so the backtick quoting MySQL needs survives intact.
+            if printf 'CREATE DATABASE IF NOT EXISTS `%s`;\nGRANT ALL ON `%s`.* TO %s;\n' \
+                    "$3" "$3" "'$2'@'%'" \
+                    | docker exec -i "$c" mysql -u root -p"$pw" >/dev/null 2>&1; then
+                info "database '$3' is present on the shared $svc"
+            else
+                warn "could not create database '$3' on $svc"
+            fi
+            ;;
+        mongodb)
+            info "mongodb creates '$3' on first write; nothing to prepare"
+            ;;
+    esac
 }
 
 drop_database() { # <project> <user> <database>
-    local pg
-    pg=$(compose_container "$1" pgsql)
-    if [ -z "$pg" ]; then warn "pgsql is not running; database '$3' was left in place"; return 0; fi
-    if ! docker exec "$pg" psql -U "$2" -d postgres -tAc \
-            "SELECT 1 FROM pg_database WHERE datname = '$3'" 2>/dev/null | grep -q '^1$'; then
-        info "no database named '$3'; nothing to drop"
-        return 0
-    fi
-    docker exec "$pg" psql -U "$2" -d postgres -q -c \
-        "DROP DATABASE IF EXISTS \"$3\" WITH (FORCE)" >/dev/null 2>&1 \
-        && info "dropped database '$3'" \
-        || warn "could not drop database '$3'"
+    local svc c pw driver
+    driver=$(db_driver); svc=$(db_service)
+    [ -n "$svc" ] || return 0
+    c=$(compose_container "$1" "$svc")
+    if [ -z "$c" ]; then warn "$svc is not running; database '$3' was left in place"; return 0; fi
+    pw=$(env_or "$MAIN_ENV" DB_PASSWORD password)
+
+    case "$driver" in
+        pgsql)
+            if ! docker exec "$c" psql -U "$2" -d postgres -tAc \
+                    "SELECT 1 FROM pg_database WHERE datname = '$3'" 2>/dev/null | grep -q '^1$'; then
+                info "no database named '$3'; nothing to drop"
+                return 0
+            fi
+            docker exec "$c" psql -U "$2" -d postgres -q -c \
+                "DROP DATABASE IF EXISTS \"$3\" WITH (FORCE)" >/dev/null 2>&1 \
+                && info "dropped database '$3'" || warn "could not drop database '$3'"
+            ;;
+        mysql|mariadb)
+            printf 'DROP DATABASE IF EXISTS `%s`;\n' "$3" \
+                | docker exec -i "$c" mysql -u root -p"$pw" >/dev/null 2>&1 \
+                && info "dropped database '$3'" || warn "could not drop database '$3'"
+            ;;
+        mongodb)
+            docker exec "$c" mongosh --quiet "$3" --eval 'db.dropDatabase()' >/dev/null 2>&1 \
+                && info "dropped database '$3'" || warn "could not drop database '$3'"
+            ;;
+    esac
 }
 
-flush_redis_prefix() { # <project> <prefix>
-    local rd
+# Redis and Valkey are the same protocol; whichever the project installed, wipe
+# only the keys carrying this worktree's prefix.
+flush_kv_prefix() { # <project> <prefix>
+    local svc c cli count
     [ -n "$2" ] || return 0
-    rd=$(compose_container "$1" redis)
-    [ -n "$rd" ] || return 0
-    local count
-    count=$(docker exec "$rd" sh -c "redis-cli --scan --pattern '$2*' | wc -l" 2>/dev/null | tr -d ' ')
-    if [ -z "$count" ] || [ "$count" = "0" ]; then return 0; fi
-    docker exec "$rd" sh -c \
-        "redis-cli --scan --pattern '$2*' | xargs -n 100 redis-cli DEL >/dev/null" 2>/dev/null \
-        && info "flushed $count redis key(s) matching '$2*'" || true
+    for svc in redis valkey; do
+        has_service "$svc" || continue
+        c=$(compose_container "$1" "$svc")
+        [ -n "$c" ] || continue
+        cli=$(docker exec "$c" sh -c 'command -v valkey-cli || command -v redis-cli' 2>/dev/null | head -1)
+        [ -n "$cli" ] || continue
+        count=$(docker exec "$c" sh -c "$cli --scan --pattern '$2*' | wc -l" 2>/dev/null | tr -d ' ')
+        [ -n "$count" ] && [ "$count" != "0" ] || continue
+        docker exec "$c" sh -c \
+            "$cli --scan --pattern '$2*' | xargs -n 100 $cli DEL >/dev/null" 2>/dev/null \
+            && info "flushed $count $svc key(s) matching '$2*'" || true
+    done
 }
 
 wait_for_container() { # <project> <service>
@@ -418,6 +525,20 @@ cmd_init() {
     env_set "$ENV_FILE" REDIS_PREFIX "${slug_}_database_"
     env_set "$ENV_FILE" CACHE_PREFIX "${slug_}_cache_"
 
+    # The remaining stateful services get a namespace of their own, so two
+    # checkouts sharing one server do not share indexes, buckets or queues.
+    # Written only when the service is actually installed, to keep .env honest.
+    if has_service meilisearch || has_service typesense; then
+        env_set "$ENV_FILE" SCOUT_PREFIX "${slug_}_"
+    fi
+    if has_service minio || has_service rustfs; then
+        # Bucket names allow lowercase and hyphens only, which is what slug is.
+        env_set "$ENV_FILE" AWS_BUCKET "$slug"
+    fi
+    if has_service rabbitmq; then
+        env_set "$ENV_FILE" RABBITMQ_QUEUE "${slug_}_default"
+    fi
+
     write_testing_env "$WORKTREE_ROOT" >/dev/null
 
     info "configured worktree ${BOLD}${slug}${NC}"
@@ -427,6 +548,7 @@ cmd_init() {
     printf '    vite            : %s\n' "$vite_port"
     printf '    database        : %s\n' "$db"
     printf '    test database   : %s\n' "$(testing_database_for "$WORKTREE_ROOT")"
+    printf '    shares          : %s\n' "$(shared_services)"
 }
 
 # Regenerate .env.testing for whichever checkout you are standing in. Unlike the
@@ -529,7 +651,7 @@ teardown() { # <worktree path>
         [ -n "$prefix" ] || continue
         [ "$prefix" != "$(env_or "$MAIN_ENV" REDIS_PREFIX "")" ] || continue
         [ "$prefix" != "$(env_or "$MAIN_ENV" CACHE_PREFIX "")" ] || continue
-        flush_redis_prefix "$main_project" "$prefix"
+        flush_kv_prefix "$main_project" "$prefix"
     done
 }
 
@@ -577,7 +699,7 @@ cmd_status() {
     project=$(detect_main_project)
 
     printf '%sshared services%s  (compose project %s)\n' "$BOLD" "$NC" "$project"
-    for svc in $SHARED_SERVICES; do
+    for svc in $(shared_services); do
         cid=$(compose_container "$project" "$svc")
         if [ -n "$cid" ]; then
             printf '    %-8s up    %s\n' "$svc" \
