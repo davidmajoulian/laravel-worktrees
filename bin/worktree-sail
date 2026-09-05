@@ -20,6 +20,7 @@
 # Usage, from anywhere inside a worktree:
 #   worktree-sail up                  configure this worktree, then start it
 #   worktree-sail init                write .env only, touch no containers
+#   worktree-sail prepare             init + shared services + database, no container
 #   worktree-sail down                stop and remove this worktree's container
 #   worktree-sail destroy             ... plus its network, volumes, database and cache
 #   worktree-sail status              list every worktree, its ports and state
@@ -373,17 +374,26 @@ cmd_init() {
     printf '    database        : %s\n' "$db"
 }
 
-cmd_up() {
+# Everything `up` does except starting the container: give this worktree its own
+# identity, make sure the shared services are running, and make sure its database
+# exists. ./sail calls this before handing a command to Sail in a worktree that
+# has not been configured yet.
+cmd_prepare() {
     assert_worktree
     cmd_init
 
-    local project user db app_port
+    local project
     project=$(detect_main_project)
     require_shared_services "$project"
+    ensure_database "$project" \
+        "$(env_or "$ENV_FILE" DB_USERNAME sail)" "$(env_or "$ENV_FILE" DB_DATABASE laravel)"
+}
 
-    user=$(env_or "$ENV_FILE" DB_USERNAME sail)
-    db=$(env_or "$ENV_FILE" DB_DATABASE laravel)
-    ensure_database "$project" "$user" "$db"
+cmd_up() {
+    assert_worktree
+    cmd_prepare
+
+    local app_port
 
     info "starting this worktree's application container"
     ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail up -d )
@@ -538,6 +548,7 @@ cmd_create() {
 
 case "${1:-}" in
     init)    shift; cmd_init "$@" ;;
+    prepare) shift; cmd_prepare "$@" ;;
     up)      shift; cmd_up "$@" ;;
     down)    shift; cmd_down "$@" ;;
     destroy) shift; cmd_destroy "$@" ;;
