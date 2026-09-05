@@ -30,6 +30,10 @@ that matters: **processes are shared, state is not.**
 `compose.yaml` is exactly what `sail:install` generated and is never edited.
 Everything here is layered on top of it.
 
+This document is the reference. To learn how it is put together — in build order,
+with the reasoning and the dead ends — read
+[building-it-from-scratch.md](building-it-from-scratch.md).
+
 ## Quick reference
 
 Run these from anywhere inside the checkout you mean.

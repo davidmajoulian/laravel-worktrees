@@ -17,10 +17,16 @@ single Postgres, Redis and Mailpit are shared between all of them.
     bin/worktree-sail status              # every checkout, its port and database
     bin/worktree-sail remove my-feature   # tear all of it back down
 
-See **[docs/worktree-isolation.md](docs/worktree-isolation.md)** for how it works
-and why. The commit history is ordered to be read from the first commit onwards:
-`git log --reverse --patch` walks from a stock Laravel install through each piece
-of the setup.
+Two documents:
+
+- **[docs/building-it-from-scratch.md](docs/building-it-from-scratch.md)** — build
+  it yourself, step by step, with the reasoning at each decision and the
+  approaches that look right but do not work.
+- **[docs/worktree-isolation.md](docs/worktree-isolation.md)** — reference for
+  using it day to day: commands, mechanisms, teardown, troubleshooting.
+
+The commit history is ordered to match: `git log --reverse --patch` walks from a
+stock Laravel install through each piece of the setup.
 
 ## About Laravel
 
