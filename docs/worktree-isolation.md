@@ -36,18 +36,21 @@ with the reasoning and the dead ends — read
 
 ## Quick reference
 
-Run these from anywhere inside the checkout you mean.
+Run these from anywhere in the repository. Where a command takes `[name|--all]`,
+no argument means the worktree you are standing in; running it from the main
+checkout without one is an error rather than a guess, so nothing acts on a
+worktree you did not name.
 
 | Command | What it does |
 | --- | --- |
 | `bin/worktree-sail create <branch> [base]` | worktree + dependencies + config + database + container + migrations |
-| `bin/worktree-sail up` | configure and start the current worktree (idempotent) |
+| `bin/worktree-sail up [name\|--all]` | configure and start a worktree (idempotent) |
 | `bin/worktree-sail prepare` | config + shared services + both databases, but no container |
 | `bin/worktree-sail init` | rewrite `.env` only; touches no containers |
 | `bin/worktree-sail testing-env` | (re)write `.env.testing`; works in the main checkout too |
 | `bin/worktree-sail status` | every checkout, its port, state and database |
-| `bin/worktree-sail down` | stop and remove this worktree's container |
-| `bin/worktree-sail destroy` | …plus its networks, volumes, database and cache keys |
+| `bin/worktree-sail down [name\|--all]` | stop and remove a worktree's container |
+| `bin/worktree-sail destroy [name\|--all]` | …plus its networks, volumes, databases and cache keys |
 | `bin/worktree-sail remove <name> [--branch]` | destroy everything, then drop the worktree |
 | `bin/worktree-sail teardown <path>` | Docker and database cleanup only, no git |
 

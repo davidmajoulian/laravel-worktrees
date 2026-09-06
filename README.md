@@ -107,7 +107,8 @@ See [Running more than one project](docs/worktree-isolation.md#running-more-than
 | Command | What it does |
 | --- | --- |
 | `bin/worktree-sail create <branch> [base]` | worktree + dependencies + config + databases + container + migrations |
-| `bin/worktree-sail up` | configure and start the current worktree (idempotent) |
+| `bin/worktree-sail up [name\|--all]` | configure and start a worktree (idempotent) |
+| `bin/worktree-sail down [name\|--all]` | stop and remove a worktree's container |
 | `bin/worktree-sail status` | every checkout, its port, state and database |
 | `bin/worktree-sail remove <name> [--branch]` | tear down Docker, databases and the worktree |
 | `bin/worktree-sail teardown <path>` | Docker and database cleanup only, for a worktree already deleted |
@@ -173,6 +174,11 @@ wt() {
 ```
 
 Then `wt create my-feature`, `wt status`, `wt remove my-feature`.
+
+`up`, `down` and `destroy` take an optional worktree name, so you can drive the
+whole lifecycle from the main checkout without changing directory — `wt up
+my-feature`, `wt down --all`. With no name they act on the worktree you are
+standing in, and from the main checkout they say so rather than guessing.
 
 Note that `sail` and `bin/worktree-sail` stay separate on purpose. The `./sail`
 shim passes every argument straight to Sail, so `sail create my-feature` does not

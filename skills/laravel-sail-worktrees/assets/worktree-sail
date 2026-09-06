@@ -17,20 +17,22 @@
 # is tracked by git. Only the tooling is, so `git worktree add` alone is enough
 # to give a new worktree this script and compose.worktree.yaml.
 #
-# Usage, from anywhere inside a worktree:
-#   worktree-sail up                  configure this worktree, then start it
-#   worktree-sail init                write .env only, touch no containers
-#   worktree-sail prepare             init + shared services + databases, no container
-#   worktree-sail testing-env         (re)write .env.testing; works in main too
-#   worktree-sail down                stop and remove this worktree's container
-#   worktree-sail destroy             ... plus its network, volumes, database and cache
-#   worktree-sail status              list every worktree, its ports and state
+# Usage, from anywhere in the repository. Where a command takes [name|--all], no
+# argument means "the worktree I am standing in", and running it from the main
+# checkout without one is an error rather than a guess:
 #
-# And from anywhere in the repository:
-#   worktree-sail create <branch> [base]   git worktree add + copy + up
-#   worktree-sail remove <name> [--branch] destroy everything, then drop the worktree
-#   worktree-sail teardown <path>          docker/database cleanup only, no git;
-#                                          this is what the WorktreeRemove hook calls
+#   worktree-sail create <branch> [base]    git worktree add + copy + up
+#   worktree-sail up      [name|--all]      configure a worktree, then start it
+#   worktree-sail down    [name|--all]      stop and remove its container
+#   worktree-sail destroy [name|--all]      ... plus its databases and cache keys
+#   worktree-sail remove  <name> [--branch] destroy everything, then drop the worktree
+#   worktree-sail status                    every checkout, its port and database
+#
+# Lower-level, for the current checkout:
+#   worktree-sail init             write .env only, touch no containers
+#   worktree-sail prepare          init + shared services + databases, no container
+#   worktree-sail testing-env      (re)write .env.testing; works in main too
+#   worktree-sail teardown <path>  docker/database cleanup only, no git
 
 set -euo pipefail
 
@@ -64,6 +66,11 @@ MAIN_ROOT=$(cd "$(dirname "$COMMON_DIR")" && pwd -P)
 
 ENV_FILE="$WORKTREE_ROOT/.env"
 MAIN_ENV="$MAIN_ROOT/.env"
+
+# This script works out which worktree it is acting on from the working directory,
+# so acting on a *named* worktree means re-running ourselves from inside it. Resolve
+# our own path now, while $0 still means something.
+SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
 
 # --- .env helpers -----------------------------------------------------------
 
@@ -472,6 +479,57 @@ sweep_docker_project() { # <project>
 
 # --- commands ---------------------------------------------------------------
 
+# A bare name means a worktree of this repository; anything with a slash is a path.
+resolve_worktree_arg() { # <name-or-path>
+    case "$1" in
+        */*) ( cd "${1%/}" 2>/dev/null && pwd -P ) || printf '%s' "${1%/}" ;;
+        *)   printf '%s/.claude/worktrees/%s' "$MAIN_ROOT" "$1" ;;
+    esac
+}
+
+all_worktrees() {
+    git -C "$MAIN_ROOT" worktree list --porcelain \
+        | awk '/^worktree /{print substr($0,10)}' \
+        | grep -v "^${MAIN_ROOT}$" || true
+}
+
+# up, down and destroy take an optional target, so the whole lifecycle can be driven
+# from the main checkout the way create and remove already are.
+#
+#   (nothing)   act on the worktree you are standing in
+#   <name>      act on .claude/worktrees/<name>
+#   --all       act on every worktree
+#
+# Returns 0 when it has handled the command itself, and 1 to mean "no target given,
+# act on the current directory" -- which is why callers test it with `if`.
+with_target() { # <command> [name|--all]
+    local cmd=$1 target=${2:-} path found=0
+    case "$target" in
+        --all)
+            while IFS= read -r path; do
+                [ -n "$path" ] || continue
+                found=1
+                info "── ${BOLD}$(basename "$path")${NC}"
+                ( cd "$path" && "$SELF" "$cmd" ) || warn "$cmd failed for $(basename "$path")"
+            done < <(all_worktrees)
+            [ "$found" = 1 ] || info "this repository has no worktrees"
+            return 0
+            ;;
+        "")
+            [ "$WORKTREE_ROOT" != "$MAIN_ROOT" ] || die \
+                "$cmd needs a worktree: name one ('$cmd <name>'), use '--all', or run it from inside one"
+            return 1
+            ;;
+        *)
+            path=$(resolve_worktree_arg "$target")
+            [ -d "$path" ] || die "no worktree at $path"
+            [ "$path" != "$MAIN_ROOT" ] || die "'$target' is the main checkout, not a worktree"
+            ( cd "$path" && "$SELF" "$cmd" )
+            return 0
+            ;;
+    esac
+}
+
 assert_worktree() {
     [ "$WORKTREE_ROOT" != "$MAIN_ROOT" ] || die \
         "this is the main checkout; it runs the stock Sail stack with 'sail up -d'"
@@ -578,6 +636,7 @@ cmd_prepare() {
 }
 
 cmd_up() {
+    if with_target up "${1:-}"; then return 0; fi
     assert_worktree
     cmd_prepare
 
@@ -600,6 +659,7 @@ cmd_up() {
 }
 
 cmd_down() {
+    if with_target down "${1:-}"; then return 0; fi
     assert_worktree
     if worktree_is_configured "$WORKTREE_ROOT"; then
         ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail down --remove-orphans ) || true
@@ -670,6 +730,7 @@ cmd_teardown() {
 }
 
 cmd_destroy() {
+    if with_target destroy "${1:-}"; then return 0; fi
     assert_worktree
     teardown "$WORKTREE_ROOT"
     info "docker and database state for this worktree is gone; the files remain"

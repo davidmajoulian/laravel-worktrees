@@ -87,6 +87,9 @@ wt remove my-feature     # tear all of it back down
 `wt` is an optional shell function; the main repository's README has it. Without it
 the same commands are `bin/worktree-sail create my-feature` and so on.
 
+`up`, `down` and `destroy` also take a worktree name or `--all`, so the lifecycle
+can be driven from the main checkout without changing directory.
+
 Note that `sail` and the worktree tooling stay separate on purpose. The `./sail`
 shim passes every argument straight through to Sail, so `sail create my-feature`
 does **not** reach this tooling — it lands on `docker compose create`, which is a
