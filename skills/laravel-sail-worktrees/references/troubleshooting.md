@@ -10,6 +10,7 @@
 | `service "laravel.test" depends on undefined service "pgsql"` | `depends_on` survived into the worktree compose file | it needs `depends_on: !reset null`; requires Compose 2.24+ |
 | Every checkout calls itself "html" | something used `base_path()` inside the container | use `IGNITION_LOCAL_SITES_PATH`, which Sail sets to the host directory |
 | Pulls hang on `error getting credentials` | Docker Desktop's credential helper is stuck; not a project problem | restart Docker Desktop, or drop `"credsStore"` from `~/.docker/config.json` |
+| Tests behave as though a recent `.env` edit never happened | `.env.testing` is a snapshot taken when it was generated | `bin/worktree-sail testing-env` |
 | A worktree Claude Code removed left containers behind | Claude Code deletes the directory and knows nothing about Docker | `bin/worktree-sail teardown <path>` — it works from the directory name alone |
 
 ## Things this setup deliberately does not do

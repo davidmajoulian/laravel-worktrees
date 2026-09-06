@@ -365,6 +365,21 @@ hosts. `prepare` creates the database; teardown drops it. The main checkout need
 the file too — run `bin/worktree-sail testing-env` there once; it reuses the
 `testing` database Sail's own init script already creates.
 
+It is a **copy**, not an overlay — Laravel reads `.env.testing` *instead of*
+`.env`, so a file holding only `DB_DATABASE` would leave the run with no app key,
+no database host and no prefixes. That also makes it a snapshot: edit `.env`
+afterwards — a new port, a rotated key, a credential for a service you just
+added — and the test environment keeps the old values until it is regenerated.
+
+```bash
+bin/worktree-sail testing-env
+```
+
+`init` and `up` regenerate it, so a worktree heals itself the next time you start
+it. The main checkout has no such trigger, so that is the one place to run it by
+hand after changing `.env`. The symptom of forgetting is a test run that behaves
+as though your edit never happened.
+
 Because `.env.testing` carries the whole environment, a missing one is dangerous:
 Laravel falls back to `.env` and the suite would run against that checkout's
 *development* database, which `RefreshDatabase` would wipe. `Tests\TestCase`

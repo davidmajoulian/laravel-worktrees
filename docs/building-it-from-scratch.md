@@ -383,6 +383,13 @@ DB_DATABASE=laravel_feature_x_testing
 The main checkout needs one too; it can keep the `testing` database Sail's init
 script already creates.
 
+Generate that file rather than writing it by hand, and regenerate it whenever
+`.env` changes. Because Laravel reads it *instead of* `.env` it has to carry the
+whole environment, which makes it a snapshot of `.env` at the moment it was
+written — edit a port or rotate the app key later and the test run keeps using the
+old values, with no error to tell you so. Deriving it from `.env` on every `init`
+is what stops the two drifting apart.
+
 That trade has a sharp edge worth closing. Without `.env.testing`, Laravel falls
 back to `.env` and the suite runs against the checkout's *development* database,
 which `RefreshDatabase` then wipes. Put a guard in `tests/TestCase.php`:
@@ -605,4 +612,5 @@ container, so using it makes every checkout call itself "html".
 | PHPUnit `<env>` beats dotenv | `.env.testing` silently ignored | remove the entry from `phpunit.xml`; it cannot be overridden |
 | Claude Code removed the worktree itself | container and database orphaned | `worktree-sail teardown <path>`; a `WorktreeRemove` hook will not do it |
 | Hooks in project `.claude/settings.json` | never run in a fresh session | put them in `~/.claude/settings.json`, which is trusted |
+| `.env.testing` is a snapshot of `.env` | tests silently use pre-edit values | regenerate with `worktree-sail testing-env` after editing `.env` |
 | A stopped container reports no ports | two projects allocate the same port | give each project a port band; detection cannot see a stopped project |
