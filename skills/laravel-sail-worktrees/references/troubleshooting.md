@@ -13,6 +13,36 @@
 | Tests behave as though a recent `.env` edit never happened | `.env.testing` is a snapshot taken when it was generated | `bin/worktree-sail testing-env` |
 | A worktree Claude Code removed left containers behind | Claude Code deletes the directory and knows nothing about Docker | `bin/worktree-sail teardown <path>` — it works from the directory name alone |
 
+## Shutting the stack down
+
+Order matters, and getting it wrong fails quietly. Worktree containers are attached
+to the **main** checkout's network, so `sail down` in the main checkout cannot
+remove that network:
+
+```
+Network <project>_sail  Removing
+Network <project>_sail  Resource is still in use
+```
+
+Compose still removes main's own containers and **still exits 0** — the warning is
+one line in the middle of a lot of output. What you are left with is an orphaned
+network and a worktree container that is still running against a database, cache
+and mail server that no longer exist, so it starts returning 500s that look like an
+application bug.
+
+Take worktrees down first, then the main checkout:
+
+```bash
+cd .claude/worktrees/<name> && ./bin/worktree-sail down
+cd <main checkout>         && sail down
+```
+
+`sail down` without `-v` keeps the volumes, so every database survives. `-v`
+destroys them.
+
+To recover from having done it in the wrong order: take the worktree down,
+`docker network rm <project>_sail`, then bring both back up. Nothing is lost.
+
 ## Things this setup deliberately does not do
 
 - **Delete search indexes, object-storage buckets or RabbitMQ queues on teardown.**

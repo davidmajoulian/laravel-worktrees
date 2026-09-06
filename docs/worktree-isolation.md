@@ -220,6 +220,34 @@ The shared services, their volumes and the shared network are all selected by th
 explicit: `resolve_project()` never resolves a worktree to the main project, and
 the database drop refuses to touch the main checkout's database.
 
+### Shutting everything down
+
+Worktrees first, then the main checkout. The order is not cosmetic: worktree
+containers are attached to the **main** project's network, so `sail down` in the
+main checkout cannot remove it.
+
+```
+Network laravel-worktrees_sail  Removing
+Network laravel-worktrees_sail  Resource is still in use
+```
+
+Compose removes main's own containers anyway and **exits 0** — that warning is a
+single line in a wall of output. You are left with an orphaned network and a
+worktree container still running against a database, cache and mail server that no
+longer exist, so it serves 500s that read like an application bug.
+
+```bash
+cd .claude/worktrees/<name> && ./bin/worktree-sail down   # each worktree first
+cd <main checkout>          && sail down                  # then the shared services
+```
+
+`sail down` keeps the volumes, so every database survives; `sail down -v` destroys
+them. `sail stop` is the lighter option when you only want the resources back and
+intend to return shortly.
+
+Done in the wrong order, recovery costs nothing: take the worktree down,
+`docker network rm laravel-worktrees_sail`, then bring both back up.
+
 ### When Claude Code removes the worktree for you
 
 Claude Code removes a worktree on its own when you exit a session that created

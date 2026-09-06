@@ -65,6 +65,12 @@ docker compose config --services       # which services are installed
   must name the file that actually exists.
 - **No `.env`** — the project has never been set up. Run `cp .env.example .env`
   and `sail artisan key:generate` first, or the install has nothing to work from.
+  Check what that copy produced before trusting it: `sail:install` rewrites `.env`
+  but never `.env.example`, so many Sail projects still have Laravel's stock
+  example describing sqlite with `REDIS_HOST=127.0.0.1`. Copying that gives a
+  config which cannot reach any container, and the app 500s with Compose warning
+  that `DB_DATABASE` is unset. Fix `.env` to match the services in the compose
+  file before going further.
 - **`DB_CONNECTION`** decides how per-worktree databases get made. Postgres, MySQL,
   MariaDB and MongoDB are handled; `sqlite` needs no database work at all because
   its file already lives inside the worktree.
@@ -173,7 +179,8 @@ import.
 
 ### 5. Write the `.env` block
 
-Append to the **main checkout's** `.env` (never `.env.example`, which is shared):
+Append the *values* to the **main checkout's** `.env` — they are per-machine, and
+`.env.example` is shared:
 
 ```dotenv
 COMPOSE_PROJECT_NAME=<project-dir-name>
@@ -186,6 +193,11 @@ WORKTREE_VITE_PORT_BASE=<from step 2>
 `COMPOSE_PROJECT_NAME` pins the network name (`<project>_sail`) that worktrees join,
 so it stops depending on what the directory happens to be called. Only add the two
 `WORKTREE_*` lines when the band is not the default.
+
+Then add the same keys to `.env.example`, commented out, with a line saying what
+they are for. The values belong in `.env`, but a teammate cloning the repo has only
+`.env.example` to learn from — and since `.env` is git-ignored, an undocumented
+knob is one nobody else will ever discover.
 
 Then generate the test environment for the main checkout, which needs one for the
 same reason a worktree does:
