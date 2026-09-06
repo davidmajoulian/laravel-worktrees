@@ -33,9 +33,12 @@ application bug.
 Take worktrees down first, then the main checkout:
 
 ```bash
-cd .claude/worktrees/<name> && ./bin/worktree-sail down
-cd <main checkout>         && sail down
+bin/worktree-sail down --all   # every worktree first
+sail down                      # then the shared services
 ```
+
+Both from the main checkout — `down` takes a name or `--all`, so there is no need
+to visit each worktree.
 
 `sail down` without `-v` keeps the volumes, so every database survives. `-v`
 destroys them.

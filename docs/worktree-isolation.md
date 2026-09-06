@@ -240,9 +240,11 @@ worktree container still running against a database, cache and mail server that 
 longer exist, so it serves 500s that read like an application bug.
 
 ```bash
-cd .claude/worktrees/<name> && ./bin/worktree-sail down   # each worktree first
-cd <main checkout>          && sail down                  # then the shared services
+bin/worktree-sail down --all   # every worktree first
+sail down                      # then the shared services
 ```
+
+Both from the main checkout, since `down` takes a name or `--all`.
 
 `sail down` keeps the volumes, so every database survives; `sail down -v` destroys
 them. `sail stop` is the lighter option when you only want the resources back and

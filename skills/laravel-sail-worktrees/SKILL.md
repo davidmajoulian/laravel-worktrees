@@ -19,8 +19,14 @@ This installs a small toolchain into an existing Laravel Sail project. Afterward
 ```bash
 bin/worktree-sail create my-feature   # worktree + deps + database + container, ~7s
 bin/worktree-sail status              # every checkout, its port and database
+bin/worktree-sail up my-feature       # start one again later
+bin/worktree-sail down --all          # stop every worktree
 bin/worktree-sail remove my-feature   # tear all of it back down
 ```
+
+All of these run from anywhere in the repository. `up`, `down` and `destroy` take
+a worktree name or `--all`; with no argument they act on the worktree you are
+standing in.
 
 Each checkout gets its own app container, `APP_PORT`/`VITE_PORT`, Compose project,
 database and cache prefix. Postgres, Redis and Mailpit stay shared — one set of
