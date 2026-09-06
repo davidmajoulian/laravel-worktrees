@@ -219,6 +219,12 @@ Tell the user the port band, the databases each checkout will get, the files add
 and the files patched, and the three commands they will actually use. Point them at
 the upstream repo for the reasoning.
 
+Worth mentioning once: `./sail` passes everything straight through to Sail, so it
+does not expose `worktree-sail`'s commands — `sail create x` reaches
+`docker compose create`, which means something else. If they want a shorthand,
+the upstream README has a `wt` shell function that resolves the repository root
+itself.
+
 ## References
 
 - `references/ports.md` — every Sail service's `FORWARD_*` variable and default

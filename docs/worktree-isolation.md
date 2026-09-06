@@ -198,6 +198,14 @@ files. The shim closes that window.
 `sail up -d` in a worktree starts the container but does not migrate. Use
 `bin/worktree-sail up` for the full sequence.
 
+The shim is a **passthrough**: after the check it hands every argument to Sail
+untouched, so it does not expose any of `worktree-sail`'s commands. `sail create
+my-feature` reaches `docker compose create`, which is a real command meaning
+something else, and `sail status` reaches a command that does not exist at all.
+That separation is deliberate — shadowing Sail's own verbs would mean you could no
+longer read `sail down` in a script and know what it does. If the typing bothers
+you, the README has a `wt` shell function.
+
 ## Tearing down
 
 `remove` deletes everything a worktree created and nothing else:

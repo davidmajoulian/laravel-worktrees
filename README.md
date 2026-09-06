@@ -154,6 +154,32 @@ Docker, PHP, Composer and Node on the host, and the usual Sail alias:
 alias sail='sh $([ -f sail ] && echo sail || echo vendor/bin/sail)'
 ```
 
+Optionally, a shorthand for the worktree commands. A function rather than an alias
+so it works from any subdirectory and explains itself in projects that don't have
+the tooling:
+
+```bash
+wt() {
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "wt: not inside a git repository" >&2; return 1
+  }
+  [ -x "$root/bin/worktree-sail" ] || {
+    echo "wt: no bin/worktree-sail in $root -- worktree isolation is not installed here" >&2
+    return 1
+  }
+  "$root/bin/worktree-sail" "$@"
+}
+```
+
+Then `wt create my-feature`, `wt status`, `wt remove my-feature`.
+
+Note that `sail` and `bin/worktree-sail` stay separate on purpose. The `./sail`
+shim passes every argument straight to Sail, so `sail create my-feature` does not
+reach this tooling — Sail forwards unknown commands to `docker compose`, where
+`create` is a real command that means something else entirely. Keeping them apart
+means `sail down` in a script still means exactly what Sail says it means.
+
 macOS or Linux. Port allocation uses `lsof`, and the dependency copy uses `cp -c`
 (an instant APFS clone on macOS, falling back to a plain copy elsewhere).
 
