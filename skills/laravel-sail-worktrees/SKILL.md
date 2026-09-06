@@ -52,11 +52,16 @@ looks fine and silently isn't.
 
 ```bash
 git rev-parse --show-toplevel          # must be a git repo; work from the root
+git rev-parse HEAD                     # ...with at least one commit
 ls compose.yaml docker-compose.yml 2>/dev/null   # which filename does this Sail use?
 grep -E '^(DB_CONNECTION|DB_DATABASE|DB_USERNAME|APP_PORT|COMPOSE_PROJECT_NAME)=' .env
 docker compose config --services       # which services are installed
 ```
 
+- **Not a git repo, or no commits yet** — likely a brand-new project, since
+  `composer create-project` does not run `git init`. Worktrees are git worktrees,
+  and `git worktree add` branches from a commit, so run `git init` and make an
+  initial commit before installing.
 - **No compose file, or no `vendor/laravel/sail`** — this project isn't on Sail.
   Say so and stop; the whole design hangs off Sail's `SAIL_FILES` hook and none of
   it transfers to Herd, Valet or a hand-rolled Docker setup.
