@@ -2,6 +2,7 @@
 
 namespace Tests;
 
+use Dotenv\Dotenv;
 use Illuminate\Foundation\Testing\TestCase as BaseTestCase;
 use Illuminate\Support\Facades\DB;
 
@@ -23,15 +24,32 @@ abstract class TestCase extends BaseTestCase
     {
         $database = DB::connection()->getDatabaseName();
 
-        // Parallel testing runs each process against <database>_test_<n>.
-        if ($database !== ':memory:' && preg_match('/testing(_test_\d+)?$/', $database) !== 1) {
+        if ($database !== ':memory:' && ! $this->isTestDatabase($database)) {
             $this->fail(
-                "Refusing to run tests against the database [{$database}]: its name does not end "
-                .'in "testing", so this looks like a development database. Run '
-                .'`bin/worktree-sail testing-env` in this checkout to generate .env.testing.'
+                "Refusing to run tests against the database [{$database}]: it is not this checkout's "
+                .'test database. Run `bin/worktree-sail testing-env` in this checkout to generate .env.testing.'
             );
         }
 
         return parent::setUpTraits();
+    }
+
+    /**
+     * Whether the database is a test database: named like one, and not this
+     * checkout's development database -- a worktree folder ending in "testing"
+     * gives a development database whose name ends in "testing" too.
+     */
+    private function isTestDatabase(string $database): bool
+    {
+        // Parallel testing runs each process against <database>_test_<n>.
+        if (preg_match('/testing(_test_\d+)?$/', $database) !== 1) {
+            return false;
+        }
+
+        $env = base_path('.env');
+        $development = is_file($env) ? (Dotenv::parse((string) file_get_contents($env))['DB_DATABASE'] ?? null) : null;
+
+        return $development === null
+            || preg_match('/^'.preg_quote($development, '/').'(_test_\d+)?$/', $database) !== 1;
     }
 }

@@ -397,6 +397,8 @@ which `RefreshDatabase` then wipes. Put a guard in `tests/TestCase.php` — in
 `RefreshDatabase` runs `migrate:fresh` there, before code after it could object.
 
 ```php
+use Dotenv\Dotenv;
+
 /**
  * Refuses to run against anything but a test database, before any trait runs.
  */
@@ -404,12 +406,29 @@ protected function setUpTraits()
 {
     $database = DB::connection()->getDatabaseName();
 
-    // Parallel testing runs each process against <database>_test_<n>.
-    if ($database !== ':memory:' && preg_match('/testing(_test_\d+)?$/', $database) !== 1) {
+    if ($database !== ':memory:' && ! $this->isTestDatabase($database)) {
         $this->fail("Refusing to run tests against the database [{$database}].");
     }
 
     return parent::setUpTraits();
+}
+
+/**
+ * Named like a test database, and not this checkout's development one -- a
+ * worktree folder ending in "testing" gives a development database that is.
+ */
+private function isTestDatabase(string $database): bool
+{
+    // Parallel testing runs each process against <database>_test_<n>.
+    if (preg_match('/testing(_test_\d+)?$/', $database) !== 1) {
+        return false;
+    }
+
+    $env = base_path('.env');
+    $development = is_file($env) ? (Dotenv::parse((string) file_get_contents($env))['DB_DATABASE'] ?? null) : null;
+
+    return $development === null
+        || preg_match('/^'.preg_quote($development, '/').'(_test_\d+)?$/', $database) !== 1;
 }
 ```
 
