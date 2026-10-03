@@ -10,7 +10,8 @@ setup_file() {
 
 teardown() {
     local w
-    for w in 90-alpha 91-beta 92-gamma 93-delta 94-epsilon 95-zeta; do cleanup_worktree "$w"; done
+    for w in 90-alpha 91-beta 92-gamma 93-delta 94-epsilon 95-zeta 96-eta; do cleanup_worktree "$w"; done
+    psql_q 'DROP DATABASE IF EXISTS "wts_canary" WITH (FORCE)' >/dev/null 2>&1 || true
     rm -rf "$FIXTURE/.claude/worktrees/rogue"
     sed -i.bak '/^WORKTREE_POST_CREATE=/d' "$FIXTURE/.env" && rm -f "$FIXTURE/.env.bak"
 }
@@ -118,4 +119,38 @@ serving() { # <dir>
     [ "$status" -eq 0 ]
     serving "$FIXTURE/.claude/worktrees/92-gamma"
     serving "$FIXTURE/.claude/worktrees/93-delta"
+}
+
+@test "the test guard refuses a development database before RefreshDatabase can touch it" {
+    ( cd "$FIXTURE" && ./bin/worktree-sail create feature/96-eta >/dev/null 2>&1 )
+    local dir="$FIXTURE/.claude/worktrees/96-eta" app
+    psql_q 'CREATE DATABASE "wts_canary"' >/dev/null
+    docker exec "$(container_of pgsql)" psql -U sail -d wts_canary -qc 'CREATE TABLE precious (id int)'
+    cat > "$dir/tests/Feature/CanaryTest.php" <<'PHP'
+<?php
+
+namespace Tests\Feature;
+
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Tests\TestCase;
+
+class CanaryTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_it_runs(): void
+    {
+        $this->assertTrue(true);
+    }
+}
+PHP
+    app=$(docker ps -q --filter "label=com.docker.compose.project=$(env_of "$dir" COMPOSE_PROJECT_NAME)" \
+        --filter label=com.docker.compose.service=laravel.test)
+
+    run docker exec -u sail -e DB_DATABASE=wts_canary "$app" php artisan test tests/Feature/CanaryTest.php
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Refusing to run tests against the database [wts_canary]"* ]]
+    # Untouched: not even RefreshDatabase's migrations ran against it.
+    [ "$(docker exec "$(container_of pgsql)" psql -U sail -d wts_canary -tAc \
+        "select string_agg(tablename, ',') from pg_tables where schemaname = 'public'")" = precious ]
 }
