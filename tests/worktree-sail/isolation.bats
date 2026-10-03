@@ -307,9 +307,12 @@ teardown() {
     local c
     c=$(add_worktree shim-c)
     cp "$A/.env" "$c/.env"
-    run bash -c "cd '$c' && sh ./sail ps -q"
+    run bash -c "cd '$c' && sh ./sail ps -q 2>/dev/null"
     [ "$(env_of "$c" WORKTREE_SAIL_ROOT)" = "$c" ]
     [ "$(env_of "$c" COMPOSE_PROJECT_NAME)" != "$(env_of "$A" COMPOSE_PROJECT_NAME)" ]
+    # Configuring says so on stderr only: stdout belongs to the wrapped command,
+    # which may be speaking a protocol (an MCP server's JSON-RPC).
+    [[ "$output" != *"==>"* ]]
     cleanup_worktree shim-c
 }
 

@@ -37,7 +37,9 @@ if [ -n "$root" ]; then
             || ! grep -qxF -e "WORKTREE_SAIL_ROOT=$root" -e "WORKTREE_SAIL_ROOT='$root'" "$root/.env" 2>/dev/null \
             || ! grep -q '^SAIL_GIT_COMMON_DIR=' "$root/.env" 2>/dev/null; then
             echo "==> this worktree is not configured for Sail yet; configuring it first" >&2
-            "$root/bin/worktree-sail" prepare
+            # Onto stderr: stdout is the wrapped command's, and it may be speaking a
+            # protocol -- an MCP server's JSON-RPC -- that stray lines would break.
+            "$root/bin/worktree-sail" prepare >&2
             echo "==> configured; handing over to Sail" >&2
         fi
     fi
