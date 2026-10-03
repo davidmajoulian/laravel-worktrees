@@ -29,7 +29,7 @@ a worktree name or `--all`; with no argument they act on the worktree you are
 standing in.
 
 Each checkout gets its own app container, `APP_PORT`/`VITE_PORT`, Compose project,
-database and cache prefix. Postgres, Redis and Mailpit stay shared — one set of
+database, key prefix and cache database. Postgres, Redis and Mailpit stay shared — one set of
 containers for the whole project. Processes are shared; state is not.
 
 Upstream, with the full reasoning: https://github.com/davidmajoulian/laravel-worktrees

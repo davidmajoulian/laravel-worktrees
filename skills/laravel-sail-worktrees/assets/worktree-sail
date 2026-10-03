@@ -331,7 +331,13 @@ resolve_project() { # <worktree path>
 # project", for a worked band.
 APP_PORT_BASE=$(env_or "$MAIN_ENV" WORKTREE_APP_PORT_BASE 8001)
 VITE_PORT_BASE=$(env_or "$MAIN_ENV" WORKTREE_VITE_PORT_BASE 5174)
-for _setting in "WORKTREE_APP_PORT_BASE=$APP_PORT_BASE" "WORKTREE_VITE_PORT_BASE=$VITE_PORT_BASE"; do
+
+# Redis/Valkey has a fixed number of numbered databases: 16, unless its own config
+# says otherwise. Laravel's cache:clear empties a whole one, so each checkout's
+# cache gets its own (REDIS_CACHE_DB), and clearing one never clears another's.
+REDIS_DATABASES=$(env_or "$MAIN_ENV" WORKTREE_REDIS_DATABASES 16)
+for _setting in "WORKTREE_APP_PORT_BASE=$APP_PORT_BASE" "WORKTREE_VITE_PORT_BASE=$VITE_PORT_BASE" \
+    "WORKTREE_REDIS_DATABASES=$REDIS_DATABASES"; do
     case "${_setting#*=}" in ''|*[!0-9]*) die "${_setting%%=*} must be a number, not '${_setting#*=}'" ;; esac
 done
 APP_SERVICE=$(env_or "$MAIN_ENV" APP_SERVICE laravel.test)
@@ -562,6 +568,55 @@ assign_ports() { # <own project> <fresh: 1 to ignore the ports .env holds>
     # Re-check against the live system, in case the port was taken since.
     revalidate_port APP_PORT  "$APP_PORT_BASE"  "$1" >/dev/null
     revalidate_port VITE_PORT "$VITE_PORT_BASE" "$1" >/dev/null
+}
+
+# --- cache databases --------------------------------------------------------
+#
+# Keys are already kept apart by prefix, but Laravel's cache:clear runs FLUSHDB,
+# which empties the whole cache database whatever the prefix -- every checkout's
+# cache at once, and the restart signal every queue worker watches. So the main
+# checkout keeps its REDIS_CACHE_DB (1 by default) and each worktree is given a
+# database of its own. Queues and sessions stay in the shared REDIS_DB, where
+# nothing flushes and the prefix is enough.
+
+has_kv_service() { has_service redis || has_service valkey; }
+
+# Whether another checkout's .env uses <index> for its cache or its other keys.
+kv_database_claimed() { # <index>
+    local f
+    while IFS= read -r f; do
+        f="$f/.env"
+        [ -f "$f" ] && [ "$f" != "$ENV_FILE" ] || continue
+        [ "$(env_or "$f" REDIS_CACHE_DB 1)" != "$1" ] || return 0
+        [ "$(env_or "$f" REDIS_DB 0)" != "$1" ] || return 0
+    done < <(all_checkouts)
+    return 1
+}
+
+# Gives this worktree's cache a database of its own. Runs under the lock, like
+# the ports: the database another run is about to claim is only visible once its
+# .env is written. A database the worktree already has is kept unless it is
+# still the main checkout's (a copied .env, or one an older version set up) or
+# another checkout uses it too (a .env copied from a sibling).
+assign_cache_database() {
+    local current own_db index=0
+    has_kv_service || return 0
+    current=$(env_or "$ENV_FILE" REDIS_CACHE_DB "")
+    case "$current" in *[!0-9]*) current="" ;; esac
+    own_db=$(env_or "$ENV_FILE" REDIS_DB 0)
+    if [ -n "$current" ] && [ "$current" != "$(env_or "$MAIN_ENV" REDIS_CACHE_DB 1)" ] \
+        && [ "$current" != "$own_db" ] && [ "$current" -lt "$REDIS_DATABASES" ] \
+        && ! kv_database_claimed "$current"; then
+        return 0
+    fi
+    while [ "$index" -lt "$REDIS_DATABASES" ]; do
+        if [ "$index" != "$own_db" ] && ! kv_database_claimed "$index"; then
+            env_set "$ENV_FILE" REDIS_CACHE_DB "$index"
+            return 0
+        fi
+        index=$((index + 1))
+    done
+    die "every one of the $REDIS_DATABASES Redis/Valkey databases is taken; remove a worktree, or raise the server's 'databases' setting and WORKTREE_REDIS_DATABASES with it"
 }
 
 # --- docker helpers ---------------------------------------------------------
@@ -1162,6 +1217,7 @@ claim_identity() { # <own project> <fresh ports: 1|0> <adopt existing names: 1|0
     fi
 
     assign_ports "$own" "$fresh"
+    assign_cache_database
 
     # Point Sail at the worktree-only Compose file and at the main project's
     # network. Because SAIL_FILES makes Sail pass an explicit -f, compose.yaml is
@@ -1263,6 +1319,7 @@ cmd_init() {
     printf '    vite            : %s\n' "$(env_or "$ENV_FILE" VITE_PORT "")"
     printf '    database        : %s\n' "$(env_or "$ENV_FILE" DB_DATABASE "")"
     printf '    test database   : %s\n' "$(testing_database_for "$WORKTREE_ROOT")"
+    ! has_kv_service || printf '    cache database  : %s\n' "$(env_or "$ENV_FILE" REDIS_CACHE_DB "")"
     printf '    shares          : %s\n' "$(shared_services)"
 }
 

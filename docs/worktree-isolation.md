@@ -149,6 +149,7 @@ The main checkout's project name is pinned in its `.env`
 | `DB_DATABASE` | own database on the shared server | `laravel_feature_x` |
 | `DB_DATABASE` in `.env.testing` | own **test** database | `laravel_feature_x_testing` |
 | `REDIS_PREFIX` / `CACHE_PREFIX` | own key namespace on the shared Redis/Valkey. `:` cannot occur in a folder slug, so no worktree's prefix is the start of another's | `wt:feature-x:db:` / `wt:feature-x:cache:` |
+| `REDIS_CACHE_DB` | own cache **database** on the shared Redis/Valkey: Laravel's `cache:clear` runs `FLUSHDB`, which ignores prefixes, so a shared one would clear every checkout's cache and restart every queue worker. Allocated under the lock, like the ports, from the lowest number no other checkout uses (`WORKTREE_REDIS_DATABASES`, default 16, is the server's count) | `2` |
 | `SAIL_GIT_COMMON_DIR` | the main checkout's `.git`, mounted read-only at the same path so git works in the container | `/path/to/app/.git` |
 | bucket variables | own buckets on the shared S3 (see below) | `feature-x`, `feature-x-public` |
 
@@ -386,6 +387,8 @@ racing, starving or reaching into each other:
   PHP version in it, so a Sail upgrade does not orphan it.
 - **No crosstalk.** A queue worker reads only keys with its own `REDIS_PREFIX`, so
   it never takes another worktree's jobs; databases and buckets are per worktree.
+  So is the cache database, so `cache:clear` in one worktree leaves the others'
+  caches -- and the restart signal their queue workers watch -- alone.
 
 `compose.worktree.yaml` carries the container settings for worktrees and
 `compose.override.yaml` the same ones for the main checkout (a worktree's explicit
@@ -455,6 +458,7 @@ into `.env` only when that service is actually installed:
 | Service | Variable | Value |
 | --- | --- | --- |
 | Redis, Valkey, Memcached | `REDIS_PREFIX`, `CACHE_PREFIX` | `wt:<slug>:db:`, `wt:<slug>:cache:` |
+| Redis, Valkey | `REDIS_CACHE_DB` | the lowest free database number |
 | Meilisearch, Typesense | `SCOUT_PREFIX` | `<slug>_` |
 | MinIO, RustFS | every variable in `WORKTREE_BUCKETS` (default `AWS_BUCKET`) | `<slug>`, `<slug>-public`, … |
 | RabbitMQ | `RABBITMQ_QUEUE` | `<slug>_default` |

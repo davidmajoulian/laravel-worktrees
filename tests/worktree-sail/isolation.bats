@@ -15,11 +15,13 @@ setup() {
 teardown() {
     cleanup_worktree iso-a
     cleanup_worktree iso-b
+    cleanup_worktree iso-c
+    sed -i.bak '/^WORKTREE_REDIS_DATABASES=/d' "$FIXTURE/.env" && rm -f "$FIXTURE/.env.bak"
 }
 
 @test "each worktree gets its own database, test database, key prefixes and buckets" {
     local k
-    for k in DB_DATABASE REDIS_PREFIX CACHE_PREFIX AWS_BUCKET AWS_PUBLIC_BUCKET APP_PORT VITE_PORT COMPOSE_PROJECT_NAME; do
+    for k in DB_DATABASE REDIS_PREFIX CACHE_PREFIX REDIS_CACHE_DB AWS_BUCKET AWS_PUBLIC_BUCKET APP_PORT VITE_PORT COMPOSE_PROJECT_NAME; do
         [ -n "$(env_of "$A" "$k")" ]
         [ "$(env_of "$A" "$k")" != "$(env_of "$B" "$k")" ]
         [ "$(env_of "$A" "$k")" != "$(env_of "$FIXTURE" "$k")" ]
@@ -45,6 +47,44 @@ teardown() {
     [ "$(valkey -n 1 EXISTS "${pa}spaced key")" = 0 ]
     [ "$(valkey -n 0 EXISTS "${pb}queue")" = 1 ]
     [ "$(valkey -n 1 EXISTS "$(env_of "$B" CACHE_PREFIX)entry")" = 1 ]
+}
+
+@test "clearing a worktree's cache, as cache:clear does, leaves every other checkout's cache alone" {
+    local main_db
+    main_db=$(env_of "$FIXTURE" REDIS_CACHE_DB); main_db=${main_db:-1}
+    [ "$(env_of "$A" REDIS_CACHE_DB)" != "$main_db" ]
+    valkey -n "$main_db" SET iso-main-entry 1 >/dev/null
+    valkey -n "$(env_of "$B" REDIS_CACHE_DB)" SET iso-b-entry 1 >/dev/null
+
+    # Laravel's cache:clear empties the cache store's whole database.
+    valkey -n "$(env_of "$A" REDIS_CACHE_DB)" FLUSHDB >/dev/null
+
+    [ "$(valkey -n "$main_db" EXISTS iso-main-entry)" = 1 ]
+    [ "$(valkey -n "$(env_of "$B" REDIS_CACHE_DB)" EXISTS iso-b-entry)" = 1 ]
+    valkey -n "$main_db" DEL iso-main-entry >/dev/null
+}
+
+@test "a worktree still on the main checkout's cache database gets one of its own on the next init" {
+    local main_db
+    main_db=$(env_of "$FIXTURE" REDIS_CACHE_DB); main_db=${main_db:-1}
+    sed -i.bak "s/^REDIS_CACHE_DB=.*/REDIS_CACHE_DB=$main_db/" "$A/.env" && rm -f "$A/.env.bak"
+
+    run wts "$A" init
+    [ "$status" -eq 0 ]
+    [ "$(env_of "$A" REDIS_CACHE_DB)" != "$main_db" ]
+    [ "$(env_of "$A" REDIS_CACHE_DB)" != "$(env_of "$B" REDIS_CACHE_DB)" ]
+}
+
+@test "init refuses, saying why, when every cache database is taken" {
+    local c last
+    # The main checkout holds 0 and 1, the two worktrees the next ones: allow no more.
+    last=$(printf '%s\n' "$(env_of "$A" REDIS_CACHE_DB)" "$(env_of "$B" REDIS_CACHE_DB)" | sort -n | tail -n 1)
+    echo "WORKTREE_REDIS_DATABASES=$((last + 1))" >> "$FIXTURE/.env"
+    c=$(add_worktree iso-c)
+
+    run wts "$c" init
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Redis/Valkey databases is taken"* ]]
 }
 
 @test "destroy drops the worktree's databases, its parallel-test ones included, and nothing else" {
@@ -138,6 +178,7 @@ teardown() {
     [ "$(env_of "$c" DB_DATABASE)" != "$(env_of "$A" DB_DATABASE)" ]
     [ "$(env_of "$c" COMPOSE_PROJECT_NAME)" != "$(env_of "$A" COMPOSE_PROJECT_NAME)" ]
     [ "$(env_of "$c" APP_PORT)" != "$(env_of "$A" APP_PORT)" ]
+    [ "$(env_of "$c" REDIS_CACHE_DB)" != "$(env_of "$A" REDIS_CACHE_DB)" ]
 
     cp "$A/.env" "$c/.env"
     run wts "$c" destroy
