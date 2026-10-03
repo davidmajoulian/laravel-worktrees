@@ -182,27 +182,54 @@ lets `.env.testing` — which Laravel loads *instead of* `.env` when `APP_ENV` i
 set — carry a per-checkout name. If the project's tests already run on sqlite
 `:memory:`, leave `phpunit.xml` alone; they are isolated already.
 
-**`tests/TestCase.php`** — add a guard to `setUp()`. Removing the `phpunit.xml`
-default opens a trapdoor: with no `.env.testing`, Laravel falls back to `.env` and
-the suite runs against that checkout's *development* database, which
-`RefreshDatabase` then wipes. The guard is what stops that being a silent disaster.
+**`tests/TestCase.php`** — add a guard that runs before the test traits. Removing
+the `phpunit.xml` default opens a trapdoor: with no `.env.testing`, Laravel falls
+back to `.env` and the suite runs against that checkout's *development* database,
+which `RefreshDatabase` then wipes. The guard is what stops that being a silent
+disaster — and it must not live in `setUp()`: `parent::setUp()` boots the traits,
+and `RefreshDatabase` runs `migrate:fresh` there, before anything after it could
+object. Overriding `setUpTraits()` runs the check once the application is up and
+before any trait touches the database.
 
 ```php
-protected function setUp(): void
-{
-    parent::setUp();
+use Dotenv\Dotenv;
 
+/**
+ * Refuses to run against anything but a test database, before any trait runs.
+ */
+protected function setUpTraits()
+{
     $database = DB::connection()->getDatabaseName();
 
-    // Parallel testing runs each process against <database>_test_<n>.
-    if ($database !== ':memory:' && preg_match('/testing(_test_\d+)?$/', $database) !== 1) {
+    if ($database !== ':memory:' && ! $this->isTestDatabase($database)) {
         $this->fail("Refusing to run tests against the database [{$database}].");
     }
+
+    return parent::setUpTraits();
+}
+
+/**
+ * Named like a test database, and not this checkout's development one -- a
+ * worktree folder ending in "testing" gives a development database that is.
+ */
+private function isTestDatabase(string $database): bool
+{
+    // Parallel testing runs each process against <database>_test_<n>.
+    if (preg_match('/testing(_test_\d+)?$/', $database) !== 1) {
+        return false;
+    }
+
+    $env = base_path('.env');
+    $development = is_file($env) ? (Dotenv::parse((string) file_get_contents($env))['DB_DATABASE'] ?? null) : null;
+
+    return $development === null
+        || preg_match('/^'.preg_quote($development, '/').'(_test_\d+)?$/', $database) !== 1;
 }
 ```
 
 Insert it into whatever is already there rather than replacing the file — many
-projects have real content in `TestCase.php`. Add the `Illuminate\Support\Facades\DB`
+projects have real content in `TestCase.php`; if one already overrides
+`setUpTraits()`, put the check at its top. Add the `Illuminate\Support\Facades\DB`
 import.
 
 ### 5. Write the `.env` block
