@@ -6,15 +6,19 @@
 # passed, Compose does not load compose.yaml at all -- so the stock Sail file
 # stays exactly as `sail:install` generated it and is never overridden here.
 #
-# Only the application container is declared. Postgres, Redis and Mailpit are
-# reused from the main checkout's Sail project by attaching to its network as an
-# external network. Data is kept apart per worktree by database name and by
-# cache/Redis key prefix, not by running a second copy of each service.
+# Only the application container is declared. The database, Redis/Valkey, S3 and
+# Mailpit are reused from the main checkout's Sail project by attaching to its
+# network as an external network. Data is kept apart per worktree by database
+# name, key prefix and bucket, not by running a second copy of each service.
 #
 # The service definition itself is inherited from compose.yaml via `extends`, so
 # worktrees automatically pick up whatever `sail:install` / a Sail upgrade puts
 # there (PHP version, volumes, Xdebug wiring, ...). Only `depends_on` is dropped,
 # since the services it names are not part of this project.
+#
+# compose.override.yaml is not loaded here either -- an explicit -f suppresses the
+# automatic override file -- so the settings below are repeated there for the main
+# checkout. Keep the two in step.
 
 services:
     laravel.test:
@@ -22,8 +26,75 @@ services:
             file: compose.yaml
             service: laravel.test
         depends_on: !reset null
+        # The app runs with APP_DEBUG on and Vite's dev server serves source files, so
+        # both listen on this machine only. SAIL_BIND_ADDRESS=0.0.0.0 opens them to
+        # the network, e.g. to try the site on a phone over Wi-Fi.
+        ports: !override
+            - '${SAIL_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-80}:80'
+            - '${SAIL_BIND_ADDRESS:-127.0.0.1}:${VITE_PORT:-5173}:${VITE_PORT:-5173}'
+        environment:
+            # `sail bin <tool>` runs as the unprivileged sail user, and git refuses a
+            # repository whose ownership it distrusts ("detected dubious ownership").
+            # Tools do not all say so: Pint reports that --dirty "is only available
+            # when using Git". The environment survives a container rebuild; a
+            # `git config --global` inside it would not.
+            GIT_CONFIG_COUNT: 1
+            GIT_CONFIG_KEY_0: safe.directory
+            GIT_CONFIG_VALUE_0: /var/www/html
+            # The empty entry before the colon keeps the image's own conf.d; this
+            # folder is read after it. A path without the PHP version in it survives
+            # a Sail upgrade.
+            PHP_INI_SCAN_DIR: ':/etc/sail/php'
+            # Playwright's flag for "next to playwright-core in node_modules" instead
+            # of a cache inside the container, which a rebuild throws away.
+            # node_modules is bind-mounted and cloned into new worktrees, so a browser
+            # downloaded once is there for every worktree.
+            PLAYWRIGHT_BROWSERS_PATH: '0'
+        configs:
+            - source: sail-php
+              target: /etc/sail/php/sail.ini
+        # A worktree's .git is a file pointing into the main checkout's .git at its
+        # host path, which the container would not otherwise have -- so git, and every
+        # tool built on it (Pint --dirty, Pest --dirty, a secrets scan), fails inside.
+        # Mounting it at that same path makes the pointer resolve. Read-only: a
+        # `git worktree prune` run in here must not be able to wipe every worktree's
+        # metadata.
+        volumes:
+            - type: bind
+              source: '${SAIL_GIT_COMMON_DIR:?run bin/worktree-sail init in this worktree}'
+              target: '${SAIL_GIT_COMMON_DIR:?run bin/worktree-sail init in this worktree}'
+              read_only: true
+        # Every worktree's container runs in the one Docker VM, so without a ceiling
+        # a run that takes too much memory takes it from the others. Over the ceiling,
+        # a process in this container is killed (exit 137) and the rest carry on.
+        # Measured on a mid-size app: an idle container holds 0.7 to 1 GB and a first
+        # PHPStan run with four workers adds 1.1 GB. No swap beyond the ceiling.
+        mem_limit: '${SAIL_CONTAINER_MEM_LIMIT:-5g}'
+        memswap_limit: '${SAIL_CONTAINER_MEM_LIMIT:-5g}'
+        # No CPU ceiling unless asked for: CPU is shared fairly by default, and a cap
+        # only slows one worktree down. Set it when one heavy run must not slow the
+        # rest (0 means none).
+        cpus: '${SAIL_CONTAINER_CPUS:-0}'
         networks:
             - sail
+
+# PHP settings for every PHP process in the container: tests, static analysis,
+# artisan, the development server.
+#
+#   opcache.enable_cli  Off for the command line by default, so every test boot
+#                       compiles config/ and routes/ again. A command-line process
+#                       keeps its cache only while it runs, so the next run still
+#                       sees every edit. Measured: a suite went from 40s to 33s and
+#                       its CPU time from 17s to 12s with the two settings together.
+#   pcov.enabled        Off. Sail's image loads the pcov coverage driver, which costs
+#                       CPU on every run while collecting nothing unless asked to.
+#                       Turn it on for the run that needs it:
+#                       `sail php -d pcov.enabled=1 vendor/bin/pest --coverage`.
+configs:
+    sail-php:
+        content: |
+            opcache.enable_cli=1
+            pcov.enabled=0
 
 networks:
     sail:

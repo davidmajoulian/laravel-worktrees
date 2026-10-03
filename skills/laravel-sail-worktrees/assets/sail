@@ -29,7 +29,13 @@ if [ -n "$root" ]; then
     main_root=$(cd "$root" && cd "$(dirname "$(git rev-parse --git-common-dir)")" && pwd -P)
 
     if [ "$root" != "$main_root" ] && [ -x "$root/bin/worktree-sail" ]; then
-        if ! grep -q '^SAIL_FILES=compose.worktree.yaml$' "$root/.env" 2>/dev/null; then
+        # Configured means configured *for this folder*: init marks .env with the
+        # folder it belongs to, so a .env copied from a sibling worktree -- which
+        # would have Sail recreate the sibling's container on these files -- does
+        # not pass. One set up before the marker existed is brought up to date.
+        if ! grep -q '^SAIL_FILES=compose.worktree.yaml$' "$root/.env" 2>/dev/null \
+            || ! grep -qxF -e "WORKTREE_SAIL_ROOT=$root" -e "WORKTREE_SAIL_ROOT='$root'" "$root/.env" 2>/dev/null \
+            || ! grep -q '^SAIL_GIT_COMMON_DIR=' "$root/.env" 2>/dev/null; then
             echo "==> this worktree is not configured for Sail yet; configuring it first" >&2
             "$root/bin/worktree-sail" prepare
             echo "==> configured; handing over to Sail" >&2

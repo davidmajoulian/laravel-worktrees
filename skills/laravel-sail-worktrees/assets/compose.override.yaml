@@ -1,0 +1,36 @@
+# Local additions to the Sail-generated compose.yaml, for the main checkout.
+#
+# Compose loads this file automatically alongside compose.yaml and merges it, so
+# compose.yaml stays exactly as `sail:install` wrote it and can be regenerated at
+# any time without losing what is here.
+#
+# A worktree loads compose.worktree.yaml instead -- an explicit -f suppresses this
+# file -- and that file carries the same application-container settings, with the
+# reasons. Keep the two in step.
+
+services:
+    laravel.test:
+        environment:
+            GIT_CONFIG_COUNT: 1
+            GIT_CONFIG_KEY_0: safe.directory
+            GIT_CONFIG_VALUE_0: /var/www/html
+            PHP_INI_SCAN_DIR: ':/etc/sail/php'
+            PLAYWRIGHT_BROWSERS_PATH: '0'
+        configs:
+            - source: sail-php
+              target: /etc/sail/php/sail.ini
+        # The app runs with APP_DEBUG on and Vite's dev server serves source files, so
+        # both listen on this machine only. SAIL_BIND_ADDRESS=0.0.0.0 opens them to
+        # the network, e.g. to try the site on a phone over Wi-Fi.
+        ports: !override
+            - '${SAIL_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-80}:80'
+            - '${SAIL_BIND_ADDRESS:-127.0.0.1}:${VITE_PORT:-5173}:${VITE_PORT:-5173}'
+        mem_limit: '${SAIL_CONTAINER_MEM_LIMIT:-5g}'
+        memswap_limit: '${SAIL_CONTAINER_MEM_LIMIT:-5g}'
+        cpus: '${SAIL_CONTAINER_CPUS:-0}'
+
+configs:
+    sail-php:
+        content: |
+            opcache.enable_cli=1
+            pcov.enabled=0

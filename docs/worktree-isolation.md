@@ -43,19 +43,24 @@ worktree you did not name.
 
 | Command | What it does |
 | --- | --- |
-| `bin/worktree-sail create <branch> [base]` | worktree + dependencies + config + database + container + migrations |
+| `bin/worktree-sail create <branch> [base]` | worktree + dependencies + config + databases + buckets + container + migrations, then `WORKTREE_POST_CREATE` |
 | `bin/worktree-sail up [name\|--all]` | configure and start a worktree (idempotent) |
-| `bin/worktree-sail prepare` | config + shared services + both databases, but no container |
+| `bin/worktree-sail prepare` | config + shared services + both databases + buckets, but no container. In the main checkout: shared services, its databases and its buckets |
 | `bin/worktree-sail init` | rewrite `.env` only; touches no containers |
 | `bin/worktree-sail testing-env` | (re)write `.env.testing`; works in the main checkout too |
 | `bin/worktree-sail status` | every checkout, its port, state and database |
 | `bin/worktree-sail down [name\|--all]` | stop and remove a worktree's container |
-| `bin/worktree-sail destroy [name\|--all]` | …plus its networks, volumes, databases and cache keys |
+| `bin/worktree-sail destroy [name\|--all]` | …plus its networks, volumes, databases, keys and buckets |
 | `bin/worktree-sail remove <name> [--branch]` | destroy everything, then drop the worktree |
-| `bin/worktree-sail teardown <path>` | Docker and database cleanup only, no git |
+| `bin/worktree-sail teardown <path>` | Docker, database and bucket cleanup only, no git |
 
-The main checkout is ordinary Sail: `sail up -d`, `sail down`. The script
-refuses to act on it.
+A name is the worktree's folder under `.claude/worktrees/`. `create` names the
+folder after the branch's last segment (`feature/12-login` → `12-login`), so the
+branch name works wherever a name does — except `remove`, which takes the folder
+name only and refuses anything with a slash in it.
+
+The main checkout is ordinary Sail: `sail up -d`, `sail down`. Apart from
+`prepare` and `testing-env`, the script refuses to act on it.
 
 ## Creating a worktree
 
@@ -65,8 +70,15 @@ refuses to act on it.
 the checkout. Then run `bin/worktree-sail up` — or just run `sail up -d`, which
 configures the worktree first (see [The `./sail` shim](#the-sail-shim)).
 
-**From the shell.** `bin/worktree-sail create my-feature` does the whole thing in
-one step, about seven seconds.
+**From the shell.** `bin/worktree-sail create feature/12-login` does the whole
+thing in one step. With no `[base]` it branches from the remote's default branch
+— `WORKTREE_BASE_BRANCH` in the main `.env` overrides that — fetched first; when
+the fetch fails it says so and starts from the copy fetched last. The branch has no upstream, so a
+bare `git push` can never land on the base branch; push with `-u origin HEAD`.
+
+`WORKTREE_POST_CREATE`, if the main `.env` sets it, runs inside the new worktree
+once it is up — for a project-specific step such as
+`./vendor/bin/sail npx playwright install chromium`.
 
 ## How it works
 
@@ -131,12 +143,49 @@ The main checkout's project name is pinned in its `.env`
 | --- | --- | --- |
 | `SAIL_FILES` | selects the worktree Compose file | `compose.worktree.yaml` |
 | `SAIL_SHARED_NETWORK` | which network to join | `laravel-worktrees_sail` |
-| `COMPOSE_PROJECT_NAME` | separates the Compose project | `laravel-worktrees-feature-x` |
+| `COMPOSE_PROJECT_NAME` | separates the Compose project; `-wt-` keeps it clear of other projects' names | `laravel-worktrees-wt-feature-x` |
 | `APP_PORT` / `VITE_PORT` | separates the published ports | `8001` / `5174` |
 | `APP_URL` | matches the port | `http://localhost:8001` |
 | `DB_DATABASE` | own database on the shared server | `laravel_feature_x` |
 | `DB_DATABASE` in `.env.testing` | own **test** database | `laravel_feature_x_testing` |
-| `REDIS_PREFIX` / `CACHE_PREFIX` | own key namespace on the shared Redis | `feature_x_database_` |
+| `REDIS_PREFIX` / `CACHE_PREFIX` | own key namespace on the shared Redis/Valkey. `:` cannot occur in a folder slug, so no worktree's prefix is the start of another's | `wt:feature-x:db:` / `wt:feature-x:cache:` |
+| `SAIL_GIT_COMMON_DIR` | the main checkout's `.git`, mounted read-only at the same path so git works in the container | `/path/to/app/.git` |
+| bucket variables | own buckets on the shared S3 (see below) | `feature-x`, `feature-x-public` |
+
+Values that need it — a path with a space, say — are written single-quoted, which
+Laravel's dotenv, Compose and Sail's `source ./.env` all read literally. Names are
+cut to fit (Postgres's 63 characters, S3's 63) with a short hash of the full name
+kept on the end, so two long branch names never meet; and `init` refuses a folder
+whose names another checkout already holds (`v1.2` and `v1-2` reduce to the same
+ones) rather than let them share state.
+
+`init` marks the `.env` with the folder it belongs to (`WORKTREE_SAIL_ROOT`). A
+`.env` without that mark for *this* folder — copied from the main checkout or from
+a sibling — is replaced with this worktree's own, ports included, and teardown
+never acts on what such a file says. The `./sail` shim checks the same mark.
+
+A worktree set up by an earlier version (no mark, named `<main>-<folder>`) is
+adopted on its next `init` under the names it already has, so its database and
+keys stay where they are. Re-running `init` never renames an existing worktree.
+
+`down`, `destroy` and `remove` do not ask Compose to take the stack down —
+`down --remove-orphans` removes every container of the project *name*, including
+another project's that shares it. Containers are removed one by one, and only
+those Compose ran from this worktree's folder. Networks and volumes record no
+folder, so they are only removed under the worktree's own `-wt-` project name,
+which no other project uses — never under an older version's name, where a
+stopped project elsewhere could own them. Containers get ten seconds to stop
+cleanly before they are removed.
+
+The app and Vite ports listen on `127.0.0.1` (`SAIL_BIND_ADDRESS` opens them), set
+through `ports: !override`, which needs Docker Compose 2.24.4 or newer. A project
+whose own `compose.override.yaml` adds more `laravel.test` ports must list them in
+that `!override` too, since it replaces the list.
+
+Two limits: a repository path containing a single quote cannot be written to
+`.env` (`init` stops with an error), and git's `worktree.useRelativePaths` setting
+writes a relative path into a worktree's `.git`, which the same-path mount of the
+main `.git` does not resolve inside the container.
 
 Docker Compose reads `COMPOSE_PROJECT_NAME` from `.env` itself, and
 `laravel-vite-plugin` already honours `VITE_PORT`, so no config file needs to
@@ -157,7 +206,7 @@ This distinction is what keeps branches clean:
 
 | | |
 | --- | --- |
-| **Tracked** — reviewable, inherited by every worktree | `compose.worktree.yaml`, `bin/worktree-sail`, `sail`, `.worktreeinclude` |
+| **Tracked** — reviewable, inherited by every worktree | `compose.worktree.yaml`, `compose.override.yaml`, `bin/worktree-sail`, `sail`, `.worktreeinclude` |
 | **Generated** — git-ignored, never in a commit | `.claude/worktrees/`, and each worktree's rewritten `.env` |
 
 Keeping the tooling tracked means `git worktree add` alone supplies it: nothing
@@ -213,10 +262,22 @@ you, the README has a `wt` shell function.
 
 `remove` deletes everything a worktree created and nothing else:
 
-- containers, networks and volumes carrying its Compose project label
-- both of its databases on the shared Postgres, development and test
-- its Redis and cache keys, by prefix
+- containers (with their anonymous volumes), networks and volumes carrying its
+  Compose project label
+- its databases on the shared server: development, test, the `<test>_test_<n>`
+  ones Laravel's parallel testing makes, and any named by
+  `WORKTREE_EXTRA_DATABASE_SUFFIXES`
+- its Redis/Valkey keys, by prefix, in **every** logical database — Laravel's
+  cache connection uses database 1, which a plain scan of database 0 never sees
+- its buckets, with everything in them
 - the worktree directory, and its branch with `--branch`
+
+A stopped shared service is started for the teardown rather than skipped, and
+anything that still cannot be removed is listed and makes the command fail:
+`remove` then **keeps the folder**, because its `.env` is the way back to what is
+left. A worktree git no longer lists — what `gh pr merge --delete-branch` leaves
+behind — is finished off rather than refused; a folder git does not list but
+that has a `.git` of its own is refused, since it is somebody's checkout.
 
 The shared services, their volumes and the shared network are all selected by the
 *main* project's labels, so they are never in scope. Two guards make that
@@ -302,6 +363,34 @@ hooks in `~/.claude/settings.json` did. Project-scoped hooks need the workspace
 trust or approval that a scripted session never grants — worth remembering when
 a project hook seems to do nothing.
 
+## Working in parallel
+
+Worktrees are meant to build and test side by side, so the tooling keeps them from
+racing, starving or reaching into each other:
+
+- **One short lock.** Allocating ports, starting the shared services and adding
+  the worktree (which fetches) run under `<git dir>/worktree-sail.lock`. Each of
+  those is quick; containers, migrations and installs run outside it, in
+  parallel. A lock left by a run that died is noticed by its pid and cleared; a
+  run started by the holder itself (a git hook calling back in) does not wait for
+  it. A waiter gives up after `WORKTREE_LOCK_TIMEOUT` seconds (default 600). git
+  never prompts for a password while the lock is held.
+- **Memory ceilings.** Every app container — main checkout and worktrees — has
+  `mem_limit` set from `SAIL_CONTAINER_MEM_LIMIT` (default `5g`) and no swap past
+  it. All containers share one Docker VM; without a ceiling, one runaway test run
+  takes memory from every other worktree. Over the ceiling, a process in that
+  container is killed (exit 137) and nothing else is touched.
+  `SAIL_CONTAINER_CPUS` adds a CPU ceiling when you want one.
+- **Cheaper PHP runs.** opcache is on for the command line and pcov off, through
+  an ini file in `/etc/sail/php` that `PHP_INI_SCAN_DIR` adds — a path without the
+  PHP version in it, so a Sail upgrade does not orphan it.
+- **No crosstalk.** A queue worker reads only keys with its own `REDIS_PREFIX`, so
+  it never takes another worktree's jobs; databases and buckets are per worktree.
+
+`compose.worktree.yaml` carries the container settings for worktrees and
+`compose.override.yaml` the same ones for the main checkout (a worktree's explicit
+`-f` suppresses the override file). Keep the two in step.
+
 ## Running more than one project
 
 Nothing here is per-machine-global except the published ports, and those are the
@@ -365,17 +454,31 @@ into `.env` only when that service is actually installed:
 
 | Service | Variable | Value |
 | --- | --- | --- |
-| Redis, Valkey, Memcached | `REDIS_PREFIX`, `CACHE_PREFIX` | `<slug>_database_`, `<slug>_cache_` |
+| Redis, Valkey, Memcached | `REDIS_PREFIX`, `CACHE_PREFIX` | `wt:<slug>:db:`, `wt:<slug>:cache:` |
 | Meilisearch, Typesense | `SCOUT_PREFIX` | `<slug>_` |
-| MinIO, RustFS | `AWS_BUCKET` | `<slug>` |
+| MinIO, RustFS | every variable in `WORKTREE_BUCKETS` (default `AWS_BUCKET`) | `<slug>`, `<slug>-public`, … |
 | RabbitMQ | `RABBITMQ_QUEUE` | `<slug>_default` |
 
 Mailpit and Selenium are shared as they are: one inbox for every checkout is
 usually what you want, and Selenium holds no state.
 
-Teardown reclaims the databases and the Redis/Valkey keys. It does **not** delete
-search indexes, object-storage buckets or RabbitMQ queues — the prefixes keep them
-from colliding, but removing them is manual.
+**Buckets.** `WORKTREE_BUCKETS` lists the variables that hold bucket names. Each
+gets a bucket per worktree, named after its folder plus whatever is left of the
+variable's name once `AWS_` and `BUCKET` come off — `AWS_BUCKET` → `<slug>`,
+`AWS_PUBLIC_BUCKET` → `<slug>-public` — cut to S3's 63 characters. `prepare`
+creates them (in the main checkout too, under the names its `.env` gives), and
+those listed in `WORKTREE_PUBLIC_BUCKETS` get an anonymous-read policy, the way a
+public CDN bucket behaves in production. The work is done by the AWS CLI
+(`WORKTREE_AWS_CLI_IMAGE`, pinned) in a throwaway container on the shared
+network, so any S3-compatible server works. Credentials come from
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, defaulting to Sail's RustFS
+values. The endpoint is always the Compose service itself (`http://rustfs:9000`
+or `http://minio:9000`), whatever `AWS_ENDPOINT` says, so a teardown can never
+reach a real bucket the application is pointed at.
+
+Teardown reclaims the databases, the Redis/Valkey keys and the buckets. Search
+indexes and RabbitMQ queues are not deleted — the prefixes keep them from
+colliding, but removing them is manual.
 
 ## Tests get their own database too
 

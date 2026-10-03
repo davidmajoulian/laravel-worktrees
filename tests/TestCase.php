@@ -23,7 +23,8 @@ abstract class TestCase extends BaseTestCase
 
         $database = DB::connection()->getDatabaseName();
 
-        if ($database !== ':memory:' && ! str_ends_with($database, 'testing')) {
+        // Parallel testing runs each process against <database>_test_<n>.
+        if ($database !== ':memory:' && preg_match('/testing(_test_\d+)?$/', $database) !== 1) {
             $this->fail(
                 "Refusing to run tests against the database [{$database}]: its name does not end "
                 .'in "testing", so this looks like a development database. Run '
