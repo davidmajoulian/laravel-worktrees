@@ -44,7 +44,7 @@ in between, deliberately.
 | Containers | Postgres, Redis, Mailpit | the `laravel.test` app container |
 | Ports | 5432 · 6379 · 1025/8025 | `APP_PORT` from 8001, `VITE_PORT` from 5174 |
 | Database | the Postgres **server** | `laravel_<name>` and `laravel_<name>_testing` |
-| Redis / Valkey | the **instance** | its own key prefix, so cache, queues, sessions and locks never cross |
+| Redis / Valkey | the **instance** | its own key prefix, so cache, queues, sessions and locks never cross, and its own cache database, so `cache:clear` clears only its own cache |
 | S3 (RustFS, MinIO) | the **server** | its own buckets, created and removed with it |
 
 ## Getting started
@@ -76,7 +76,9 @@ bin/worktree-sail create feature/12-login     # lands in .claude/worktrees/12-lo
 
 Seconds later that worktree is serving on its own port, branched from the
 remote's default branch, with dependencies cloned, its databases and buckets
-created and migrations run. Creating a
+created and migrations run. When the branch's `composer.lock` or JavaScript
+lockfile differs from the main checkout's, its dependencies are installed instead
+of trusted, before the migrations run. Creating a
 worktree through Claude Code's own worktree feature works too: `.worktreeinclude`
 carries `.env`, `vendor/` and `node_modules/` across, and the `./sail` shim
 configures the worktree the first time you run any `sail` command in it.
@@ -118,7 +120,9 @@ by agents — without one slowing down or breaking another:
 - **Less CPU per run.** opcache is on and pcov off for the PHP command line, which
   cut one test suite from 40s to 33s.
 - **No crosstalk.** Databases, key prefixes and buckets are per worktree, so one
-  worktree's queue worker never picks up another's jobs.
+  worktree's queue worker never picks up another's jobs. Each worktree's cache has
+  a Redis/Valkey database of its own, since `cache:clear` empties a whole one.
+  Worktrees set up by an older version get theirs on their next `up`.
 - **Nothing left behind.** `destroy` and `remove` drop the databases (Laravel's
   parallel-test ones included), flush the keys in every logical database, delete
   the buckets — and refuse to report success while anything is still there.
@@ -156,6 +160,7 @@ The main checkout stays plain Sail: `sail up -d`, `sail down`, `sail test`.
 | `SAIL_CONTAINER_MEM_LIMIT` | `5g` | memory ceiling of each app container |
 | `SAIL_CONTAINER_CPUS` | none | CPU ceiling of each app container |
 | `WORKTREE_LOCK_TIMEOUT` | `600` | seconds a run waits for another to release the lock |
+| `WORKTREE_REDIS_DATABASES` | `16` | how many numbered databases the Redis/Valkey server has; each worktree's cache takes one |
 | `SAIL_BIND_ADDRESS` | `127.0.0.1` | where the app and Vite ports listen; `0.0.0.0` opens them to the network |
 
 Settings are read from the main checkout's `.env`, except `SAIL_BIND_ADDRESS` and

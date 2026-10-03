@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
 # Port allocation: worktrees set up at the same moment, or sitting in folders a
-# glob would miss, must never be handed the same port.
+# glob would miss, must never be handed the same port -- or cache database, which
+# is allocated under the same lock.
 
 load helpers
 
@@ -18,11 +19,13 @@ teardown() {
     for w in "${dirs[@]}"; do wts "$w" init >/dev/null 2>&1 & pids+=($!); done
     for w in "${pids[@]}"; do wait "$w"; done
 
-    local apps vites
+    local apps vites caches
     apps=$(for w in "${dirs[@]}"; do env_of "$w" APP_PORT; done)
     vites=$(for w in "${dirs[@]}"; do env_of "$w" VITE_PORT; done)
+    caches=$(for w in "${dirs[@]}"; do env_of "$w" REDIS_CACHE_DB; done)
     [ "$(printf '%s\n' "$apps" | sort -u | wc -l)" -eq 5 ]
     [ "$(printf '%s\n' "$vites" | sort -u | wc -l)" -eq 5 ]
+    [ "$(printf '%s\n' "$caches" | sort -u | wc -l)" -eq 5 ]
     # None of them took the main checkout's ports.
     refute grep -qx 18080 <<< "$apps"
 }

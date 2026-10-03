@@ -149,6 +149,7 @@ The main checkout's project name is pinned in its `.env`
 | `DB_DATABASE` | own database on the shared server | `laravel_feature_x` |
 | `DB_DATABASE` in `.env.testing` | own **test** database | `laravel_feature_x_testing` |
 | `REDIS_PREFIX` / `CACHE_PREFIX` | own key namespace on the shared Redis/Valkey. `:` cannot occur in a folder slug, so no worktree's prefix is the start of another's | `wt:feature-x:db:` / `wt:feature-x:cache:` |
+| `REDIS_CACHE_DB` | own cache **database** on the shared Redis/Valkey: Laravel's `cache:clear` runs `FLUSHDB`, which ignores prefixes, so a shared one would clear every checkout's cache, and with it the restart signal queue workers watch. Allocated under the lock, like the ports, from the lowest number no other checkout uses (`WORKTREE_REDIS_DATABASES`, default 16, is the server's count) | `2` |
 | `SAIL_GIT_COMMON_DIR` | the main checkout's `.git`, mounted read-only at the same path so git works in the container | `/path/to/app/.git` |
 | bucket variables | own buckets on the shared S3 (see below) | `feature-x`, `feature-x-public` |
 
@@ -229,6 +230,18 @@ and copying what matches. `bin/worktree-sail create` runs the same query, so bot
 routes produce identical results. On APFS the copy uses `cp -c`, which clones:
 `vendor/` and `node_modules/` together take about two seconds and no extra disk.
 
+The clones are the main checkout's dependencies, which are right only while the
+branch's lockfiles are main's. So `create` compares them once the container is up:
+where `composer.lock` differs it runs `composer install`, and where the JavaScript
+lockfile does (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock` or `bun.lock`) the
+matching frozen install, both before the migrations. With identical lockfiles
+nothing is installed, so the common case stays instant. Until every install has
+succeeded, a marker in the worktree's git directory makes each `up` try again,
+and `create` itself fails, so a half-installed worktree never passes for a ready
+one. A worktree made through
+Claude Code's own feature gets no such check: run the installs yourself when its
+branch changed a lockfile.
+
 ## The `./sail` shim
 
 The usual alias prefers a project-local `sail` file:
@@ -268,7 +281,8 @@ you, the README has a `wt` shell function.
   ones Laravel's parallel testing makes, and any named by
   `WORKTREE_EXTRA_DATABASE_SUFFIXES`
 - its Redis/Valkey keys, by prefix, in **every** logical database — Laravel's
-  cache connection uses database 1, which a plain scan of database 0 never sees
+  cache connection uses one of its own (`REDIS_CACHE_DB`), which a plain scan of
+  database 0 never sees
 - its buckets, with everything in them
 - the worktree directory, and its branch with `--branch`
 
@@ -386,6 +400,8 @@ racing, starving or reaching into each other:
   PHP version in it, so a Sail upgrade does not orphan it.
 - **No crosstalk.** A queue worker reads only keys with its own `REDIS_PREFIX`, so
   it never takes another worktree's jobs; databases and buckets are per worktree.
+  So is the cache database, so `cache:clear` in one worktree leaves the others'
+  caches -- and the restart signal their queue workers watch -- alone.
 
 `compose.worktree.yaml` carries the container settings for worktrees and
 `compose.override.yaml` the same ones for the main checkout (a worktree's explicit
@@ -455,6 +471,7 @@ into `.env` only when that service is actually installed:
 | Service | Variable | Value |
 | --- | --- | --- |
 | Redis, Valkey, Memcached | `REDIS_PREFIX`, `CACHE_PREFIX` | `wt:<slug>:db:`, `wt:<slug>:cache:` |
+| Redis, Valkey | `REDIS_CACHE_DB` | the lowest free database number |
 | Meilisearch, Typesense | `SCOUT_PREFIX` | `<slug>_` |
 | MinIO, RustFS | every variable in `WORKTREE_BUCKETS` (default `AWS_BUCKET`) | `<slug>`, `<slug>-public`, … |
 | RabbitMQ | `RABBITMQ_QUEUE` | `<slug>_default` |
