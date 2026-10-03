@@ -43,6 +43,11 @@ setup_suite() {
     (
         cd "$FIXTURE" || exit 1
         git checkout --quiet -B dev
+        # The clone also has the branch the repository had checked out -- main, when
+        # CI runs on a push to main -- and tests create branches by such names.
+        git for-each-ref --format='%(refname:short)' refs/heads | while IFS= read -r branch; do
+            [ "$branch" = dev ] || git branch --quiet -D "$branch"
+        done
         git add -A
         git -c user.name=test -c user.email=test@example.com commit --quiet -m fixture --allow-empty
         git remote set-url origin "$FIXTURE_PARENT/origin.git"
