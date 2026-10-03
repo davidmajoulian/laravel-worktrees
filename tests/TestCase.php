@@ -14,13 +14,13 @@ abstract class TestCase extends BaseTestCase
      * tracked and so cannot name a different database in each worktree.
      *
      * If .env.testing is missing, Laravel falls back to .env and the suite would
-     * run against this checkout's *development* database, which RefreshDatabase
-     * would then wipe. Refuse rather than destroy someone's work in progress.
+     * run against this checkout's *development* database. The check runs here, not
+     * in setUp(): setUp() boots the traits first, and RefreshDatabase starts with
+     * migrate:fresh -- by the time setUp() could object, the wrong database would
+     * already have been rebuilt.
      */
-    protected function setUp(): void
+    protected function setUpTraits()
     {
-        parent::setUp();
-
         $database = DB::connection()->getDatabaseName();
 
         // Parallel testing runs each process against <database>_test_<n>.
@@ -31,5 +31,7 @@ abstract class TestCase extends BaseTestCase
                 .'`bin/worktree-sail testing-env` in this checkout to generate .env.testing.'
             );
         }
+
+        return parent::setUpTraits();
     }
 }
