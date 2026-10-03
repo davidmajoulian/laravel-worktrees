@@ -1360,6 +1360,36 @@ cmd_prepare() {
     ensure_buckets "$ENV_FILE"
 }
 
+# A new worktree starts with clones of the main checkout's vendor/ and
+# node_modules/. They are right only while the branch's lockfiles are main's;
+# where one differs -- a branch that adds or upgrades a package -- the
+# dependencies are installed for real, before anything (migrations included)
+# loads them. Only `create` asks for this: later, the lockfiles differing from
+# main's says nothing about what is installed.
+sync_dependencies() {
+    local lock install
+    if [ -f "$WORKTREE_ROOT/composer.lock" ] && ! cmp -s "$WORKTREE_ROOT/composer.lock" "$MAIN_ROOT/composer.lock"; then
+        info "composer.lock differs from the main checkout's; installing Composer dependencies"
+        ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail composer install --no-interaction ) \
+            || warn "composer install failed; run it in the worktree before relying on its dependencies"
+    fi
+    for lock in package-lock.json pnpm-lock.yaml yarn.lock bun.lock; do
+        [ -f "$WORKTREE_ROOT/$lock" ] || continue
+        ! cmp -s "$WORKTREE_ROOT/$lock" "$MAIN_ROOT/$lock" || return 0
+        case "$lock" in
+            package-lock.json) install="npm ci" ;;
+            pnpm-lock.yaml)    install="pnpm install --frozen-lockfile" ;;
+            yarn.lock)         install="yarn install --frozen-lockfile" ;;
+            bun.lock)          install="bun install --frozen-lockfile" ;;
+        esac
+        info "$lock differs from the main checkout's; installing Node dependencies"
+        # shellcheck disable=SC2086 # $install is a command and its arguments
+        ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail $install ) \
+            || warn "'$install' failed; run it in the worktree before relying on its dependencies"
+        return 0
+    done
+}
+
 cmd_up() {
     if with_target up "${1:-}"; then return 0; fi
     assert_worktree
@@ -1371,6 +1401,7 @@ cmd_up() {
     ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail up -d )
     wait_for_container "$(resolve_project "$WORKTREE_ROOT")" laravel.test \
         || die "the application container did not start"
+    [ "${WORKTREE_SAIL_NEW:-}" != 1 ] || sync_dependencies
 
     # Migrate before probing HTTP: with database sessions, every request 500s
     # until the schema exists.
@@ -1746,7 +1777,7 @@ cmd_create() {
     copy_includes "$dir"
     # Run it from inside the new worktree: the script resolves which worktree it
     # is acting on from the working directory, not from its own path.
-    ( cd "$dir" && ./bin/worktree-sail up )
+    ( cd "$dir" && WORKTREE_SAIL_NEW=1 ./bin/worktree-sail up )
     post_create "$dir"
 }
 

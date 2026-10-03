@@ -230,6 +230,15 @@ and copying what matches. `bin/worktree-sail create` runs the same query, so bot
 routes produce identical results. On APFS the copy uses `cp -c`, which clones:
 `vendor/` and `node_modules/` together take about two seconds and no extra disk.
 
+The clones are the main checkout's dependencies, which are right only while the
+branch's lockfiles are main's. So `create` compares them once the container is up:
+where `composer.lock` differs it runs `composer install`, and where the JavaScript
+lockfile does (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock` or `bun.lock`) the
+matching frozen install, both before the migrations. With identical lockfiles
+nothing is installed, so the common case stays instant. A worktree made through
+Claude Code's own feature gets no such check: run the installs yourself when its
+branch changed a lockfile.
+
 ## The `./sail` shim
 
 The usual alias prefers a project-local `sail` file:

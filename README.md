@@ -76,7 +76,9 @@ bin/worktree-sail create feature/12-login     # lands in .claude/worktrees/12-lo
 
 Seconds later that worktree is serving on its own port, branched from the
 remote's default branch, with dependencies cloned, its databases and buckets
-created and migrations run. Creating a
+created and migrations run. When the branch's `composer.lock` or JavaScript
+lockfile differs from the main checkout's, its dependencies are installed instead
+of trusted, before the migrations run. Creating a
 worktree through Claude Code's own worktree feature works too: `.worktreeinclude`
 carries `.env`, `vendor/` and `node_modules/` across, and the `./sail` shim
 configures the worktree the first time you run any `sail` command in it.

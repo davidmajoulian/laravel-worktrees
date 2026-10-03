@@ -10,7 +10,8 @@ setup_file() {
 
 teardown() {
     local w
-    for w in 90-alpha 91-beta 92-gamma 93-delta 94-epsilon 95-zeta 96-eta 97-load-testing; do cleanup_worktree "$w"; done
+    for w in 90-alpha 91-beta 92-gamma 93-delta 94-epsilon 95-zeta 96-eta 97-load-testing 98-theta; do cleanup_worktree "$w"; done
+    git -C "$FIXTURE" branch -D deps-base >/dev/null 2>&1 || true
     psql_q 'DROP DATABASE IF EXISTS "wts_canary" WITH (FORCE)' >/dev/null 2>&1 || true
     rm -rf "$FIXTURE/.claude/worktrees/rogue"
     sed -i.bak '/^WORKTREE_POST_CREATE=/d' "$FIXTURE/.env" && rm -f "$FIXTURE/.env.bak"
@@ -30,6 +31,28 @@ serving() { # <dir>
     # No upstream: a plain `git push` must not target dev.
     refute git -C "$dir" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1
     serving "$dir"
+    # Its lockfiles are main's, so the cloned dependencies stand.
+    [[ "$output" != *"differs from the main checkout's"* ]]
+}
+
+@test "create installs the dependencies when its branch's lockfile differs from the main checkout's" {
+    # A base branch whose composer.lock differs only in its content hash, so the
+    # install finds every package already there and needs no network.
+    local index blob tree commit
+    index="$BATS_TEST_TMPDIR/index"
+    blob=$(sed 's/"content-hash": "[^"]*"/"content-hash": "changed-by-the-test"/' "$FIXTURE/composer.lock" \
+        | git -C "$FIXTURE" hash-object -w --stdin)
+    GIT_INDEX_FILE=$index git -C "$FIXTURE" read-tree dev
+    GIT_INDEX_FILE=$index git -C "$FIXTURE" update-index --cacheinfo "100644,$blob,composer.lock"
+    tree=$(GIT_INDEX_FILE=$index git -C "$FIXTURE" write-tree)
+    commit=$(git -C "$FIXTURE" -c user.name=test -c user.email=test@example.com commit-tree "$tree" -p dev -m 'change composer.lock')
+    git -C "$FIXTURE" branch deps-base "$commit"
+
+    run bash -c "cd '$FIXTURE' && ./bin/worktree-sail create feature/98-theta deps-base"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"composer.lock differs from the main checkout's; installing Composer dependencies"* ]]
+    [[ "$output" != *"composer install failed"* ]]
+    serving "$FIXTURE/.claude/worktrees/98-theta"
 }
 
 @test "a warm create is serving requests in under 60 seconds" {
