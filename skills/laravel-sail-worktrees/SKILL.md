@@ -182,27 +182,35 @@ lets `.env.testing` — which Laravel loads *instead of* `.env` when `APP_ENV` i
 set — carry a per-checkout name. If the project's tests already run on sqlite
 `:memory:`, leave `phpunit.xml` alone; they are isolated already.
 
-**`tests/TestCase.php`** — add a guard to `setUp()`. Removing the `phpunit.xml`
-default opens a trapdoor: with no `.env.testing`, Laravel falls back to `.env` and
-the suite runs against that checkout's *development* database, which
-`RefreshDatabase` then wipes. The guard is what stops that being a silent disaster.
+**`tests/TestCase.php`** — add a guard that runs before the test traits. Removing
+the `phpunit.xml` default opens a trapdoor: with no `.env.testing`, Laravel falls
+back to `.env` and the suite runs against that checkout's *development* database,
+which `RefreshDatabase` then wipes. The guard is what stops that being a silent
+disaster — and it must not live in `setUp()`: `parent::setUp()` boots the traits,
+and `RefreshDatabase` runs `migrate:fresh` there, before anything after it could
+object. Overriding `setUpTraits()` runs the check once the application is up and
+before any trait touches the database.
 
 ```php
-protected function setUp(): void
+/**
+ * Refuses to run against anything but a test database, before any trait runs.
+ */
+protected function setUpTraits()
 {
-    parent::setUp();
-
     $database = DB::connection()->getDatabaseName();
 
     // Parallel testing runs each process against <database>_test_<n>.
     if ($database !== ':memory:' && preg_match('/testing(_test_\d+)?$/', $database) !== 1) {
         $this->fail("Refusing to run tests against the database [{$database}].");
     }
+
+    return parent::setUpTraits();
 }
 ```
 
 Insert it into whatever is already there rather than replacing the file — many
-projects have real content in `TestCase.php`. Add the `Illuminate\Support\Facades\DB`
+projects have real content in `TestCase.php`; if one already overrides
+`setUpTraits()`, put the check at its top. Add the `Illuminate\Support\Facades\DB`
 import.
 
 ### 5. Write the `.env` block

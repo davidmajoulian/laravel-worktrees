@@ -392,19 +392,24 @@ is what stops the two drifting apart.
 
 That trade has a sharp edge worth closing. Without `.env.testing`, Laravel falls
 back to `.env` and the suite runs against the checkout's *development* database,
-which `RefreshDatabase` then wipes. Put a guard in `tests/TestCase.php`:
+which `RefreshDatabase` then wipes. Put a guard in `tests/TestCase.php` — in
+`setUpTraits()`, not `setUp()`: `parent::setUp()` boots the traits, and
+`RefreshDatabase` runs `migrate:fresh` there, before code after it could object.
 
 ```php
-protected function setUp(): void
+/**
+ * Refuses to run against anything but a test database, before any trait runs.
+ */
+protected function setUpTraits()
 {
-    parent::setUp();
-
     $database = DB::connection()->getDatabaseName();
 
     // Parallel testing runs each process against <database>_test_<n>.
     if ($database !== ':memory:' && preg_match('/testing(_test_\d+)?$/', $database) !== 1) {
         $this->fail("Refusing to run tests against the database [{$database}].");
     }
+
+    return parent::setUpTraits();
 }
 ```
 
