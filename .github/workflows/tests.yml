@@ -1,0 +1,62 @@
+# Lints the tooling and runs its bats suite against real Docker. Actions are
+# pinned to commit SHAs: a tag can be moved by whoever owns it.
+name: tests
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: tests-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    shellcheck:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+            - run: shellcheck --severity=warning bin/worktree-sail sail
+            - name: Skill assets match the tooling
+              run: |
+                  cmp bin/worktree-sail skills/laravel-sail-worktrees/assets/worktree-sail
+                  cmp compose.worktree.yaml skills/laravel-sail-worktrees/assets/compose.worktree.yaml
+                  cmp compose.override.yaml skills/laravel-sail-worktrees/assets/compose.override.yaml
+                  cmp sail skills/laravel-sail-worktrees/assets/sail
+
+    # The script runs under macOS's own bash 3.2 when Homebrew's bash isn't first on
+    # the PATH; the bats suite needs bash 4+, so this checks what 3.2 must parse.
+    macos-bash-3:
+        runs-on: macos-latest
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+            - run: /bin/bash --version | head -n 1
+            - run: /bin/bash -n bin/worktree-sail
+            - run: /bin/sh -n sail
+
+    bats:
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  fetch-depth: 0
+                  persist-credentials: false
+            - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+              with:
+                  php-version: '8.5'
+                  coverage: none
+            - run: composer install --no-interaction --no-progress --prefer-dist
+            - uses: bats-core/bats-action@77d6fb60505b4d0d1d73e48bd035b55074bbfb43 # 4.0.0
+            - name: Identify git for the fixture's commits
+              run: |
+                  git config --global user.name ci
+                  git config --global user.email ci@example.com
+            - run: bats --timing tests/worktree-sail

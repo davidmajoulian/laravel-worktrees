@@ -1,0 +1,95 @@
+# The main checkout's Compose file for the test fixture: the stock Sail app
+# service plus every stateful service worktree-sail knows how to namespace.
+# Copied into a throwaway clone of this repository by setup_suite.
+services:
+    laravel.test:
+        build:
+            context: './vendor/laravel/sail/runtimes/8.5'
+            dockerfile: Dockerfile
+            args:
+                WWWGROUP: '${WWWGROUP}'
+        image: '${WTS_FIXTURE_IMAGE:-wtstest/app}'
+        extra_hosts:
+            - 'host.docker.internal:host-gateway'
+        ports:
+            - '${APP_PORT:-80}:80'
+            - '${VITE_PORT:-5173}:${VITE_PORT:-5173}'
+        environment:
+            WWWUSER: '${WWWUSER}'
+            LARAVEL_SAIL: 1
+            XDEBUG_MODE: '${SAIL_XDEBUG_MODE:-off}'
+            XDEBUG_CONFIG: '${SAIL_XDEBUG_CONFIG:-client_host=host.docker.internal}'
+            IGNITION_LOCAL_SITES_PATH: '${PWD}'
+        volumes:
+            - '.:/var/www/html'
+        networks:
+            - sail
+        depends_on:
+            - pgsql
+            - valkey
+            - rustfs
+            - mailpit
+    pgsql:
+        image: 'postgres:18.6-alpine'
+        ports:
+            - '${FORWARD_DB_PORT:-5432}:5432'
+        environment:
+            PGPASSWORD: '${DB_PASSWORD:-secret}'
+            POSTGRES_DB: '${DB_DATABASE}'
+            POSTGRES_USER: '${DB_USERNAME}'
+            POSTGRES_PASSWORD: '${DB_PASSWORD:-secret}'
+        volumes:
+            - 'sail-pgsql:/var/lib/postgresql'
+            - './vendor/laravel/sail/database/pgsql/create-testing-database.sql:/docker-entrypoint-initdb.d/10-create-testing-database.sql'
+        networks:
+            - sail
+        healthcheck:
+            test: ['CMD', 'pg_isready', '-q', '-d', '${DB_DATABASE}', '-U', '${DB_USERNAME}']
+            retries: 3
+            timeout: 5s
+    valkey:
+        image: 'valkey/valkey:9.1.2-alpine'
+        ports:
+            - '${FORWARD_VALKEY_PORT:-6379}:6379'
+        volumes:
+            - 'sail-valkey:/data'
+        networks:
+            - sail
+        healthcheck:
+            test: ['CMD', 'valkey-cli', 'ping']
+            retries: 3
+            timeout: 5s
+    rustfs:
+        image: 'rustfs/rustfs:1.0.0'
+        ports:
+            - '${FORWARD_RUSTFS_PORT:-9000}:9000'
+            - '${FORWARD_RUSTFS_CONSOLE_PORT:-9001}:9001'
+        environment:
+            RUSTFS_VOLUMES: '/data'
+            RUSTFS_ADDRESS: '0.0.0.0:9000'
+            RUSTFS_CONSOLE_ADDRESS: '0.0.0.0:9001'
+            RUSTFS_CONSOLE_ENABLE: 'true'
+            RUSTFS_EXTERNAL_ADDRESS: ':9000'
+            RUSTFS_ACCESS_KEY: 'sail'
+            RUSTFS_SECRET_KEY: 'password'
+        volumes:
+            - 'sail-rustfs:/data'
+        networks:
+            - sail
+    mailpit:
+        image: 'axllent/mailpit:v1.31.3'
+        ports:
+            - '${FORWARD_MAILPIT_PORT:-1025}:1025'
+            - '${FORWARD_MAILPIT_DASHBOARD_PORT:-8025}:8025'
+        networks:
+            - sail
+networks:
+    sail:
+        driver: bridge
+volumes:
+    sail-pgsql:
+        driver: local
+    sail-valkey:
+        driver: local
+    sail-rustfs:
+        driver: local
