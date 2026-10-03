@@ -2,8 +2,8 @@
 name: laravel-sail-worktrees
 description: >-
   Install per-worktree Laravel Sail isolation into an existing Sail project, so every git
-  worktree gets its own application container, ports and databases while one Postgres/MySQL,
-  Redis and Mailpit are shared between them all. Use this whenever someone wants to work on
+  worktree gets its own application container, ports, databases and buckets while one
+  Postgres/MySQL, Redis/Valkey, S3 (RustFS/MinIO) and Mailpit are shared between them all. Use this whenever someone wants to work on
   several branches of a Laravel app at the same time, run parallel sessions or agents whose
   containers would otherwise fight over ports, keep branches from trampling each other's
   database, set up git worktrees for a Sail project, or add a second Laravel project's
@@ -17,7 +17,7 @@ description: >-
 This installs a small toolchain into an existing Laravel Sail project. Afterwards:
 
 ```bash
-bin/worktree-sail create my-feature   # worktree + deps + database + container, ~7s
+bin/worktree-sail create feature/12-x # worktree + deps + databases + buckets + container, seconds
 bin/worktree-sail status              # every checkout, its port and database
 bin/worktree-sail up my-feature       # start one again later
 bin/worktree-sail down --all          # stop every worktree
@@ -115,16 +115,32 @@ theirs.
 
 ### 3. Copy the files in
 
-Four files, none of which touch anything Sail generated:
+Five files, none of which touch anything Sail generated:
 
 ```bash
 mkdir -p bin
 cp <skill>/assets/worktree-sail      bin/worktree-sail   && chmod +x bin/worktree-sail
 cp <skill>/assets/compose.worktree.yaml compose.worktree.yaml
 cp <skill>/assets/worktreeinclude    .worktreeinclude
+[ -e compose.override.yaml ] || cp <skill>/assets/compose.override.yaml compose.override.yaml
 ```
 
-The fourth is a `sail` shim at the project root. The conventional Sail alias
+`compose.override.yaml` gives the main checkout's app container the same settings
+`compose.worktree.yaml` gives a worktree's: git's `safe.directory`, opcache on and
+pcov off for the command line, a memory ceiling so parallel worktrees cannot
+starve each other, and app and Vite ports that listen on `127.0.0.1` only
+(`SAIL_BIND_ADDRESS` opens them; `ports: !override` needs Compose 2.24.4+ and
+replaces the whole list, so carry over any extra ports the project's own override
+had). Also bind the data services to this machine with Sail's `FORWARD_*`
+variables (`FORWARD_DB_PORT=127.0.0.1:5432` and so on). **If the project already has one, do not overwrite it** — merge
+the `laravel.test` settings and the `configs` block into it, and show the user.
+
+If the project has object storage (RustFS or MinIO) with more than one bucket, set
+`WORKTREE_BUCKETS` (and `WORKTREE_PUBLIC_BUCKETS` for the public ones) in the main
+`.env` — see the settings table in the repository's README. Then run
+`bin/worktree-sail prepare` in the main checkout to create its own buckets.
+
+The fifth is a `sail` shim at the project root. The conventional Sail alias
 (`sh $([ -f sail ] && echo sail || echo vendor/bin/sail)`) prefers it, which makes
 it the one place every `sail` command passes through; in a worktree it configures
 the worktree before handing over. **If the project already has a root `sail` file,
@@ -178,7 +194,8 @@ protected function setUp(): void
 
     $database = DB::connection()->getDatabaseName();
 
-    if ($database !== ':memory:' && ! str_ends_with($database, 'testing')) {
+    // Parallel testing runs each process against <database>_test_<n>.
+    if ($database !== ':memory:' && preg_match('/testing(_test_\d+)?$/', $database) !== 1) {
         $this->fail("Refusing to run tests against the database [{$database}].");
     }
 }

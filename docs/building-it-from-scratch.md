@@ -306,13 +306,13 @@ Every line below exists for a reason:
 ```dotenv
 SAIL_FILES=compose.worktree.yaml              # use the worktree Compose file
 SAIL_SHARED_NETWORK=laravel-worktrees_sail      # attach to the main project's network
-COMPOSE_PROJECT_NAME=laravel-worktrees-feature-x # separate Compose project → separate containers
+COMPOSE_PROJECT_NAME=laravel-worktrees-wt-feature-x # separate Compose project → separate containers
 APP_PORT=8001                                 # separate published ports
 VITE_PORT=5174
 APP_URL=http://localhost:8001                 # so generated URLs match
 DB_DATABASE=laravel_feature_x                 # own database on the shared server
-REDIS_PREFIX=feature_x_database_              # own keyspace on the shared Redis
-CACHE_PREFIX=feature_x_cache_
+REDIS_PREFIX=wt:feature-x:db:                 # own keyspace on the shared Redis
+CACHE_PREFIX=wt:feature-x:cache:
 ```
 
 Most of those keys already exist in the copied file. Changing them in place keeps
@@ -401,7 +401,8 @@ protected function setUp(): void
 
     $database = DB::connection()->getDatabaseName();
 
-    if ($database !== ':memory:' && ! str_ends_with($database, 'testing')) {
+    // Parallel testing runs each process against <database>_test_<n>.
+    if ($database !== ':memory:' && preg_match('/testing(_test_\d+)?$/', $database) !== 1) {
         $this->fail("Refusing to run tests against the database [{$database}].");
     }
 }
@@ -471,10 +472,12 @@ path, or it configures whichever worktree you happened to be standing in.
 `COMPOSE_PROJECT_NAME=laravel-worktrees` with no `SAIL_FILES`. Run
 `sail down --volumes` against that from a worktree and Compose resolves the
 **main** project — deleting the main checkout's containers *and* its Postgres
-volume. This repo did exactly that once. Three guards now prevent it:
-`worktree_is_configured()` gates every Sail invocation, `resolve_project()` never
-resolves a worktree to the main project, and the database drop refuses to touch
-the main checkout's database.
+volume. This repo did exactly that once. Several guards now prevent it: `init`
+marks each worktree's `.env` with the folder it belongs to and `env_is_own()`
+trusts nothing else; `down` and teardown never ask Compose to take a stack down,
+removing only containers Compose ran from the worktree's folder;
+`resolve_project()` never resolves a worktree to the main project; and the
+database drops refuse to touch the main checkout's databases.
 
 ---
 

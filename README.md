@@ -44,7 +44,8 @@ in between, deliberately.
 | Containers | Postgres, Redis, Mailpit | the `laravel.test` app container |
 | Ports | 5432 · 6379 · 1025/8025 | `APP_PORT` from 8001, `VITE_PORT` from 5174 |
 | Database | the Postgres **server** | `laravel_<name>` and `laravel_<name>_testing` |
-| Redis | the Redis **instance** | its own key prefix |
+| Redis / Valkey | the **instance** | its own key prefix, so cache, queues, sessions and locks never cross |
+| S3 (RustFS, MinIO) | the **server** | its own buckets, created and removed with it |
 
 ## Getting started
 
@@ -70,11 +71,12 @@ it automatically.
 Then give any branch its own environment:
 
 ```bash
-bin/worktree-sail create my-feature
+bin/worktree-sail create feature/12-login     # lands in .claude/worktrees/12-login
 ```
 
-About seven seconds later that worktree is serving on its own port, with
-dependencies cloned, its databases created and migrations run. Creating a
+Seconds later that worktree is serving on its own port, branched from the
+remote's default branch, with dependencies cloned, its databases and buckets
+created and migrations run. Creating a
 worktree through Claude Code's own worktree feature works too: `.worktreeinclude`
 carries `.env`, `vendor/` and `node_modules/` across, and the `./sail` shim
 configures the worktree the first time you run any `sail` command in it.
@@ -102,19 +104,65 @@ WORKTREE_VITE_PORT_BASE=5274
 
 See [Running more than one project](docs/worktree-isolation.md#running-more-than-one-project).
 
+## Working in parallel
+
+Several worktrees are meant to run, build and test at the same time — by hand or
+by agents — without one slowing down or breaking another:
+
+- **No races.** Port allocation, starting the shared services and adding the
+  worktree run under one short lock in the shared git directory, so two `create`s
+  started together get different ports. Everything slow runs side by side.
+- **No starvation.** Each app container has a memory ceiling (5 GB by default,
+  `SAIL_CONTAINER_MEM_LIMIT`); a run that blows it is killed alone, and the rest
+  carry on. A CPU ceiling is available too (`SAIL_CONTAINER_CPUS`).
+- **Less CPU per run.** opcache is on and pcov off for the PHP command line, which
+  cut one test suite from 40s to 33s.
+- **No crosstalk.** Databases, key prefixes and buckets are per worktree, so one
+  worktree's queue worker never picks up another's jobs.
+- **Nothing left behind.** `destroy` and `remove` drop the databases (Laravel's
+  parallel-test ones included), flush the keys in every logical database, delete
+  the buckets — and refuse to report success while anything is still there.
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `bin/worktree-sail create <branch> [base]` | worktree + dependencies + config + databases + container + migrations |
+| `bin/worktree-sail create <branch> [base]` | worktree (from the remote's default branch) + dependencies + config + databases + buckets + container + migrations |
 | `bin/worktree-sail up [name\|--all]` | configure and start a worktree (idempotent) |
 | `bin/worktree-sail down [name\|--all]` | stop and remove a worktree's container |
 | `bin/worktree-sail status` | every checkout, its port, state and database |
-| `bin/worktree-sail remove <name> [--branch]` | tear down Docker, databases and the worktree |
-| `bin/worktree-sail teardown <path>` | Docker and database cleanup only, for a worktree already deleted |
+| `bin/worktree-sail destroy [name\|--all]` | everything `down` does, plus its databases, keys and buckets |
+| `bin/worktree-sail remove <name> [--branch]` | tear down Docker, databases, keys, buckets and the worktree |
+| `bin/worktree-sail prepare` | in the main checkout: start the shared services, create its databases and buckets |
+| `bin/worktree-sail teardown <path>` | Docker, database and bucket cleanup only, for a worktree already deleted |
 | `bin/worktree-sail testing-env` | (re)write `.env.testing`; needed once in the main checkout |
 
+A worktree's name is its folder, which is the branch after its last slash
+(`feature/12-login` → `12-login`); commands that take a name accept the branch
+too.
+
 The main checkout stays plain Sail: `sail up -d`, `sail down`, `sail test`.
+
+### Settings (main checkout's `.env`)
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `WORKTREE_APP_PORT_BASE`, `WORKTREE_VITE_PORT_BASE` | `8001`, `5174` | where port allocation starts |
+| `WORKTREE_BASE_BRANCH` | the remote's default branch | what `create` branches from |
+| `WORKTREE_BUCKETS` | `AWS_BUCKET` | variables holding bucket names; each gets a per-worktree bucket |
+| `WORKTREE_PUBLIC_BUCKETS` | — | which of those allow anonymous reads (like a public CDN bucket) |
+| `WORKTREE_EXTRA_DATABASE_SUFFIXES` | — | databases your own tooling derives from a worktree's name, dropped with it |
+| `WORKTREE_POST_CREATE` | — | a command run inside each new worktree after it is up |
+| `SAIL_CONTAINER_MEM_LIMIT` | `5g` | memory ceiling of each app container |
+| `SAIL_CONTAINER_CPUS` | none | CPU ceiling of each app container |
+| `WORKTREE_LOCK_TIMEOUT` | `600` | seconds a run waits for another to release the lock |
+| `SAIL_BIND_ADDRESS` | `127.0.0.1` | where the app and Vite ports listen; `0.0.0.0` opens them to the network |
+
+Settings are read from the main checkout's `.env`, except `SAIL_BIND_ADDRESS` and
+the two `SAIL_CONTAINER_*` ceilings: Compose reads those from each checkout's own `.env`,
+which a worktree copied when it was created — set them before creating worktrees,
+or in each worktree's `.env`. `WORKTREE_POST_CREATE` runs for `create` only, not
+for worktrees Claude Code makes itself.
 
 ## Installing this into your own project
 
@@ -129,6 +177,19 @@ cp -R skills/laravel-sail-worktrees ~/.claude/skills/
 Then ask Claude, from your own Sail project, to set it up so each branch gets its
 own environment. See [skills/README.md](skills/README.md). Prefer to do it by
 hand? The tutorial below is the same procedure, written out.
+
+## Tests
+
+The tooling has its own suite, which drives real Docker against a throwaway copy
+of this repository on a port band of its own (it never touches your projects):
+
+```bash
+composer install
+bats tests/worktree-sail                    # everything; full.bats builds the Sail image once
+bats tests/worktree-sail/isolation.bats     # one area
+```
+
+CI runs it on pushes to `main` and on every pull request, alongside shellcheck.
 
 ## Documentation
 
@@ -186,7 +247,7 @@ reach this tooling — Sail forwards unknown commands to `docker compose`, where
 `create` is a real command that means something else entirely. Keeping them apart
 means `sail down` in a script still means exactly what Sail says it means.
 
-macOS or Linux. Port allocation uses `lsof`, and the dependency copy uses `cp -c`
+Docker Compose 2.24.4 or newer (for `!override`). macOS or Linux. Port allocation uses `lsof`, and the dependency copy uses `cp -c`
 (an instant APFS clone on macOS, falling back to a plain copy elsewhere).
 
 Built against Laravel 13, Sail 1.67, PHP 8.5 and Postgres 18, but nothing here is
