@@ -122,6 +122,7 @@ by agents — without one slowing down or breaking another:
 - **No crosstalk.** Databases, key prefixes and buckets are per worktree, so one
   worktree's queue worker never picks up another's jobs. Each worktree's cache has
   a Redis/Valkey database of its own, since `cache:clear` empties a whole one.
+  Worktrees set up by an older version get theirs on their next `up`.
 - **Nothing left behind.** `destroy` and `remove` drop the databases (Laravel's
   parallel-test ones included), flush the keys in every logical database, delete
   the buckets — and refuse to report success while anything is still there.

@@ -149,7 +149,7 @@ The main checkout's project name is pinned in its `.env`
 | `DB_DATABASE` | own database on the shared server | `laravel_feature_x` |
 | `DB_DATABASE` in `.env.testing` | own **test** database | `laravel_feature_x_testing` |
 | `REDIS_PREFIX` / `CACHE_PREFIX` | own key namespace on the shared Redis/Valkey. `:` cannot occur in a folder slug, so no worktree's prefix is the start of another's | `wt:feature-x:db:` / `wt:feature-x:cache:` |
-| `REDIS_CACHE_DB` | own cache **database** on the shared Redis/Valkey: Laravel's `cache:clear` runs `FLUSHDB`, which ignores prefixes, so a shared one would clear every checkout's cache and restart every queue worker. Allocated under the lock, like the ports, from the lowest number no other checkout uses (`WORKTREE_REDIS_DATABASES`, default 16, is the server's count) | `2` |
+| `REDIS_CACHE_DB` | own cache **database** on the shared Redis/Valkey: Laravel's `cache:clear` runs `FLUSHDB`, which ignores prefixes, so a shared one would clear every checkout's cache, and with it the restart signal queue workers watch. Allocated under the lock, like the ports, from the lowest number no other checkout uses (`WORKTREE_REDIS_DATABASES`, default 16, is the server's count) | `2` |
 | `SAIL_GIT_COMMON_DIR` | the main checkout's `.git`, mounted read-only at the same path so git works in the container | `/path/to/app/.git` |
 | bucket variables | own buckets on the shared S3 (see below) | `feature-x`, `feature-x-public` |
 
@@ -235,7 +235,10 @@ branch's lockfiles are main's. So `create` compares them once the container is u
 where `composer.lock` differs it runs `composer install`, and where the JavaScript
 lockfile does (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock` or `bun.lock`) the
 matching frozen install, both before the migrations. With identical lockfiles
-nothing is installed, so the common case stays instant. A worktree made through
+nothing is installed, so the common case stays instant. Until every install has
+succeeded, a marker in the worktree's git directory makes each `up` try again,
+and `create` itself fails, so a half-installed worktree never passes for a ready
+one. A worktree made through
 Claude Code's own feature gets no such check: run the installs yourself when its
 branch changed a lockfile.
 
@@ -278,7 +281,8 @@ you, the README has a `wt` shell function.
   ones Laravel's parallel testing makes, and any named by
   `WORKTREE_EXTRA_DATABASE_SUFFIXES`
 - its Redis/Valkey keys, by prefix, in **every** logical database — Laravel's
-  cache connection uses database 1, which a plain scan of database 0 never sees
+  cache connection uses one of its own (`REDIS_CACHE_DB`), which a plain scan of
+  database 0 never sees
 - its buckets, with everything in them
 - the worktree directory, and its branch with `--branch`
 

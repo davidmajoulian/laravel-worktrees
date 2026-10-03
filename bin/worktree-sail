@@ -8,7 +8,8 @@
 #                                                 main project's "sail" network
 #
 # Isolated per worktree : app container, APP_PORT, VITE_PORT, Compose project,
-#                         databases, Redis/Valkey key prefix, object-storage buckets.
+#                         databases, Redis/Valkey key prefix and cache database,
+#                         object-storage buckets.
 # Shared by all of them  : the database, Redis/Valkey, S3 and Mailpit containers.
 #
 # Everything is driven by variables written into the worktree's .env. The
@@ -574,21 +575,32 @@ assign_ports() { # <own project> <fresh: 1 to ignore the ports .env holds>
 #
 # Keys are already kept apart by prefix, but Laravel's cache:clear runs FLUSHDB,
 # which empties the whole cache database whatever the prefix -- every checkout's
-# cache at once, and the restart signal every queue worker watches. So the main
+# cache at once, and the restart signal queue workers watch. So the main
 # checkout keeps its REDIS_CACHE_DB (1 by default) and each worktree is given a
 # database of its own. Queues and sessions stay in the shared REDIS_DB, where
 # nothing flushes and the prefix is enough.
 
 has_kv_service() { has_service redis || has_service valkey; }
 
+# A database number as Laravel reads it -- an integer, so 02 is database 2 -- or
+# nothing when the value is not a plain number of sensible length.
+kv_number() { # <value>
+    case "$1" in ''|*[!0-9]*) return 0 ;; esac
+    [ "${#1}" -le 6 ] || return 0
+    printf '%s' "$((10#$1))"
+}
+
 # Whether another checkout's .env uses <index> for its cache or its other keys.
+# A .env that is not its folder's own -- a copy of another checkout's, not yet
+# set up -- claims nothing: the checkout it was copied from does, and keeps it.
 kv_database_claimed() { # <index>
-    local f
-    while IFS= read -r f; do
-        f="$f/.env"
+    local other f
+    while IFS= read -r other; do
+        f="$other/.env"
         [ -f "$f" ] && [ "$f" != "$ENV_FILE" ] || continue
-        [ "$(env_or "$f" REDIS_CACHE_DB 1)" != "$1" ] || return 0
-        [ "$(env_or "$f" REDIS_DB 0)" != "$1" ] || return 0
+        if [ "$other" != "$MAIN_ROOT" ] && ! env_is_own "$other"; then continue; fi
+        [ "$(kv_number "$(env_or "$f" REDIS_CACHE_DB 1)")" != "$1" ] || return 0
+        [ "$(kv_number "$(env_or "$f" REDIS_DB 0)")" != "$1" ] || return 0
     done < <(all_checkouts)
     return 1
 }
@@ -601,10 +613,10 @@ kv_database_claimed() { # <index>
 assign_cache_database() {
     local current own_db index=0
     has_kv_service || return 0
-    current=$(env_or "$ENV_FILE" REDIS_CACHE_DB "")
-    case "$current" in *[!0-9]*) current="" ;; esac
-    own_db=$(env_or "$ENV_FILE" REDIS_DB 0)
-    if [ -n "$current" ] && [ "$current" != "$(env_or "$MAIN_ENV" REDIS_CACHE_DB 1)" ] \
+    current=$(kv_number "$(env_or "$ENV_FILE" REDIS_CACHE_DB "")")
+    own_db=$(kv_number "$(env_or "$ENV_FILE" REDIS_DB 0)")
+    own_db=${own_db:-0}
+    if [ -n "$current" ] && [ "$current" != "$(kv_number "$(env_or "$MAIN_ENV" REDIS_CACHE_DB 1)")" ] \
         && [ "$current" != "$own_db" ] && [ "$current" -lt "$REDIS_DATABASES" ] \
         && ! kv_database_claimed "$current"; then
         return 0
@@ -817,8 +829,8 @@ parallel_test_databases() { # <project> <user> <test database>
 
 # Redis and Valkey are the same protocol; whichever the project installed, wipe
 # only the keys carrying this worktree's prefix -- in every logical database that
-# holds any, because Laravel's cache connection is database 1 and a scan sees
-# only the database it runs in. The keys are matched and deleted inside the
+# holds any, because Laravel's cache connection uses a database of its own (the
+# worktree's REDIS_CACHE_DB) and a scan sees only the database it runs in. The keys are matched and deleted inside the
 # server, so one with a space or a quote in its name goes like the rest.
 flush_kv_prefix() { # <project> <prefix>
     local svc c cli dbs db count total
@@ -1364,30 +1376,48 @@ cmd_prepare() {
 # node_modules/. They are right only while the branch's lockfiles are main's;
 # where one differs -- a branch that adds or upgrades a package -- the
 # dependencies are installed for real, before anything (migrations included)
-# loads them. Only `create` asks for this: later, the lockfiles differing from
-# main's says nothing about what is installed.
+# loads them.
+#
+# `create` leaves a marker in the worktree's git directory, and every `up` runs
+# this while it is there; it goes only once each install has succeeded. So a
+# create that stopped early, or an install that failed, is finished by the next
+# `up` rather than forgotten. Without the marker, lockfiles differing from main's
+# say nothing about what is installed, so nothing runs.
+dependency_marker() { # <worktree path>
+    printf '%s/worktree-sail-install-dependencies' "$(git -C "$1" rev-parse --absolute-git-dir)"
+}
+
 sync_dependencies() {
-    local lock install
+    local lock install failed=0
     if [ -f "$WORKTREE_ROOT/composer.lock" ] && ! cmp -s "$WORKTREE_ROOT/composer.lock" "$MAIN_ROOT/composer.lock"; then
         info "composer.lock differs from the main checkout's; installing Composer dependencies"
-        ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail composer install --no-interaction ) \
-            || warn "composer install failed; run it in the worktree before relying on its dependencies"
+        if ! ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail composer install --no-interaction ); then
+            warn "composer install failed"; failed=1
+        fi
     fi
     for lock in package-lock.json pnpm-lock.yaml yarn.lock bun.lock; do
         [ -f "$WORKTREE_ROOT/$lock" ] || continue
-        ! cmp -s "$WORKTREE_ROOT/$lock" "$MAIN_ROOT/$lock" || return 0
-        case "$lock" in
-            package-lock.json) install="npm ci" ;;
-            pnpm-lock.yaml)    install="pnpm install --frozen-lockfile" ;;
-            yarn.lock)         install="yarn install --frozen-lockfile" ;;
-            bun.lock)          install="bun install --frozen-lockfile" ;;
-        esac
-        info "$lock differs from the main checkout's; installing Node dependencies"
-        # shellcheck disable=SC2086 # $install is a command and its arguments
-        ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail $install ) \
-            || warn "'$install' failed; run it in the worktree before relying on its dependencies"
-        return 0
+        if ! cmp -s "$WORKTREE_ROOT/$lock" "$MAIN_ROOT/$lock"; then
+            case "$lock" in
+                package-lock.json) install="npm ci" ;;
+                pnpm-lock.yaml)    install="pnpm install --frozen-lockfile" ;;
+                yarn.lock)         install="yarn install --frozen-lockfile" ;;
+                bun.lock)          install="bun install --frozen-lockfile" ;;
+            esac
+            info "$lock differs from the main checkout's; installing Node dependencies"
+            # shellcheck disable=SC2086 # $install is a command and its arguments
+            if ! ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail $install ); then
+                warn "'$install' failed"; failed=1
+            fi
+        fi
+        # One package manager per project: the first lockfile found is its.
+        break
     done
+    if [ "$failed" = 0 ]; then
+        rm -f "$(dependency_marker "$WORKTREE_ROOT")"
+    else
+        warn "this worktree's dependencies are not all installed; the next \`up\` tries again"
+    fi
 }
 
 cmd_up() {
@@ -1401,7 +1431,7 @@ cmd_up() {
     ( cd "$WORKTREE_ROOT" && ./vendor/bin/sail up -d )
     wait_for_container "$(resolve_project "$WORKTREE_ROOT")" laravel.test \
         || die "the application container did not start"
-    [ "${WORKTREE_SAIL_NEW:-}" != 1 ] || sync_dependencies
+    [ ! -f "$(dependency_marker "$WORKTREE_ROOT")" ] || sync_dependencies
 
     # Migrate before probing HTTP: with database sessions, every request 500s
     # until the schema exists.
@@ -1775,9 +1805,12 @@ cmd_create() {
     if [ -z "$base" ]; then base=$(default_branch); explicit=0; fi
     with_lock add_worktree "$name" "$dir" "$base" "$explicit"
     copy_includes "$dir"
+    touch "$(dependency_marker "$dir")"
     # Run it from inside the new worktree: the script resolves which worktree it
     # is acting on from the working directory, not from its own path.
-    ( cd "$dir" && WORKTREE_SAIL_NEW=1 ./bin/worktree-sail up )
+    ( cd "$dir" && ./bin/worktree-sail up )
+    [ ! -f "$(dependency_marker "$dir")" ] \
+        || die "$(basename "$dir") is up, but its dependencies are not all installed; fix the cause, then run: bin/worktree-sail up $(basename "$dir")"
     post_create "$dir"
 }
 

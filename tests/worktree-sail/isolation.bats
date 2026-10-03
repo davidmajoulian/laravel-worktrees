@@ -33,20 +33,25 @@ teardown() {
 @test "destroy flushes the worktree's keys in every logical database and leaves the other's" {
     local pa pb
     pa=$(env_of "$A" REDIS_PREFIX); pb=$(env_of "$B" REDIS_PREFIX)
+    local da db
+    da=$(env_of "$A" REDIS_CACHE_DB); db=$(env_of "$B" REDIS_CACHE_DB)
+    # Laravel's cache keys carry both prefixes, in the worktree's own cache database.
     valkey -n 0 SET "${pa}queue" 1 >/dev/null
-    valkey -n 1 SET "$(env_of "$A" CACHE_PREFIX)entry" 1 >/dev/null
-    valkey -n 1 SET "${pa}spaced key" 1 >/dev/null
+    valkey -n "$da" SET "${pa}$(env_of "$A" CACHE_PREFIX)entry" 1 >/dev/null
+    valkey -n "$da" SET "${pa}spaced key" 1 >/dev/null
+    valkey -n 1 SET "${pa}left-in-the-main-cache-database" 1 >/dev/null
     valkey -n 0 SET "${pb}queue" 1 >/dev/null
-    valkey -n 1 SET "$(env_of "$B" CACHE_PREFIX)entry" 1 >/dev/null
+    valkey -n "$db" SET "${pb}$(env_of "$B" CACHE_PREFIX)entry" 1 >/dev/null
 
     run wts "$A" destroy
     [ "$status" -eq 0 ]
 
     [ "$(valkey -n 0 EXISTS "${pa}queue")" = 0 ]
-    [ "$(valkey -n 1 EXISTS "$(env_of "$A" CACHE_PREFIX)entry")" = 0 ]
-    [ "$(valkey -n 1 EXISTS "${pa}spaced key")" = 0 ]
+    [ "$(valkey -n "$da" EXISTS "${pa}$(env_of "$A" CACHE_PREFIX)entry")" = 0 ]
+    [ "$(valkey -n "$da" EXISTS "${pa}spaced key")" = 0 ]
+    [ "$(valkey -n 1 EXISTS "${pa}left-in-the-main-cache-database")" = 0 ]
     [ "$(valkey -n 0 EXISTS "${pb}queue")" = 1 ]
-    [ "$(valkey -n 1 EXISTS "$(env_of "$B" CACHE_PREFIX)entry")" = 1 ]
+    [ "$(valkey -n "$db" EXISTS "${pb}$(env_of "$B" CACHE_PREFIX)entry")" = 1 ]
 }
 
 @test "clearing a worktree's cache, as cache:clear does, leaves every other checkout's cache alone" {
@@ -73,6 +78,33 @@ teardown() {
     [ "$status" -eq 0 ]
     [ "$(env_of "$A" REDIS_CACHE_DB)" != "$main_db" ]
     [ "$(env_of "$A" REDIS_CACHE_DB)" != "$(env_of "$B" REDIS_CACHE_DB)" ]
+}
+
+@test "a .env copied but not yet set up never takes the cache database of the checkout it came from" {
+    local c before
+    before=$(env_of "$A" REDIS_CACHE_DB)
+    c=$(add_worktree iso-c)
+    cp "$A/.env" "$c/.env"
+
+    run wts "$A" init
+    [ "$status" -eq 0 ]
+    [ "$(env_of "$A" REDIS_CACHE_DB)" = "$before" ]
+
+    run wts "$c" init
+    [ "$status" -eq 0 ]
+    [ "$(env_of "$c" REDIS_CACHE_DB)" != "$before" ]
+}
+
+@test "cache database numbers are read as Laravel reads them, as integers" {
+    local main_db
+    main_db=$(env_of "$FIXTURE" REDIS_CACHE_DB); main_db=${main_db:-1}
+    # 0<n> is database n to Laravel: the main checkout's, so A must move off it.
+    sed -i.bak "s/^REDIS_CACHE_DB=.*/REDIS_CACHE_DB=0$main_db/" "$A/.env" && rm -f "$A/.env.bak"
+
+    run wts "$A" init
+    [ "$status" -eq 0 ]
+    [ "$(env_of "$A" REDIS_CACHE_DB)" != "0$main_db" ]
+    [ "$(env_of "$A" REDIS_CACHE_DB)" != "$main_db" ]
 }
 
 @test "init refuses, saying why, when every cache database is taken" {

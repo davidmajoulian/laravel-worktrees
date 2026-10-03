@@ -36,23 +36,58 @@ serving() { # <dir>
 }
 
 @test "create installs the dependencies when its branch's lockfile differs from the main checkout's" {
-    # A base branch whose composer.lock differs only in its content hash, so the
-    # install finds every package already there and needs no network.
-    local index blob tree commit
+    # A base branch that drops laravel/pint: the install has to remove it from the
+    # worktree's vendor, which needs no network.
+    local index tree commit dir install migrate
     index="$BATS_TEST_TMPDIR/index"
-    blob=$(sed 's/"content-hash": "[^"]*"/"content-hash": "changed-by-the-test"/' "$FIXTURE/composer.lock" \
-        | git -C "$FIXTURE" hash-object -w --stdin)
+    jq 'del(."require-dev"."laravel/pint")' "$FIXTURE/composer.json" > "$BATS_TEST_TMPDIR/composer.json"
+    jq '."packages-dev" |= map(select(.name != "laravel/pint"))' "$FIXTURE/composer.lock" > "$BATS_TEST_TMPDIR/composer.lock"
     GIT_INDEX_FILE=$index git -C "$FIXTURE" read-tree dev
-    GIT_INDEX_FILE=$index git -C "$FIXTURE" update-index --cacheinfo "100644,$blob,composer.lock"
+    GIT_INDEX_FILE=$index git -C "$FIXTURE" update-index --cacheinfo \
+        "100644,$(git -C "$FIXTURE" hash-object -w "$BATS_TEST_TMPDIR/composer.json"),composer.json"
+    GIT_INDEX_FILE=$index git -C "$FIXTURE" update-index --cacheinfo \
+        "100644,$(git -C "$FIXTURE" hash-object -w "$BATS_TEST_TMPDIR/composer.lock"),composer.lock"
     tree=$(GIT_INDEX_FILE=$index git -C "$FIXTURE" write-tree)
-    commit=$(git -C "$FIXTURE" -c user.name=test -c user.email=test@example.com commit-tree "$tree" -p dev -m 'change composer.lock')
+    commit=$(git -C "$FIXTURE" -c user.name=test -c user.email=test@example.com commit-tree "$tree" -p dev -m 'drop laravel/pint')
     git -C "$FIXTURE" branch deps-base "$commit"
 
     run bash -c "cd '$FIXTURE' && ./bin/worktree-sail create feature/98-theta deps-base"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"composer.lock differs from the main checkout's; installing Composer dependencies"* ]]
-    [[ "$output" != *"composer install failed"* ]]
-    serving "$FIXTURE/.claude/worktrees/98-theta"
+    dir="$FIXTURE/.claude/worktrees/98-theta"
+    [ ! -e "$dir/vendor/laravel/pint" ]
+    [ -d "$FIXTURE/vendor/laravel/pint" ]
+    # Installed before anything -- the migrations included -- loaded the old set.
+    install=$(printf '%s\n' "$output" | awk '/installing Composer dependencies/ { print NR; exit }')
+    migrate=$(printf '%s\n' "$output" | awk '/[Mm]igrat/ { print NR; exit }')
+    [ -n "$install" ] && [ -n "$migrate" ] && [ "$install" -lt "$migrate" ]
+    [ ! -e "$(git -C "$dir" rev-parse --absolute-git-dir)/worktree-sail-install-dependencies" ]
+    serving "$dir"
+}
+
+@test "an up after a failed install tries again, and create says the worktree is not ready" {
+    # A lock whose pint download is somewhere that does not exist, under a
+    # reference no cache can hold: the install has to fail.
+    local index tree commit dir
+    index="$BATS_TEST_TMPDIR/index"
+    jq '(."packages-dev"[] | select(.name == "laravel/pint")) |= (.version = "v0.0.1"
+        | .dist.url = "https://invalid.invalid/pint.zip"
+        | .dist.reference = "0000000000000000000000000000000000000000" | .source = null)' \
+        "$FIXTURE/composer.lock" > "$BATS_TEST_TMPDIR/composer.lock"
+    GIT_INDEX_FILE=$index git -C "$FIXTURE" read-tree dev
+    GIT_INDEX_FILE=$index git -C "$FIXTURE" update-index --cacheinfo \
+        "100644,$(git -C "$FIXTURE" hash-object -w "$BATS_TEST_TMPDIR/composer.lock"),composer.lock"
+    tree=$(GIT_INDEX_FILE=$index git -C "$FIXTURE" write-tree)
+    commit=$(git -C "$FIXTURE" -c user.name=test -c user.email=test@example.com commit-tree "$tree" -p dev -m 'break the lock')
+    git -C "$FIXTURE" branch deps-base "$commit"
+
+    run bash -c "cd '$FIXTURE' && ./bin/worktree-sail create feature/98-theta deps-base"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"dependencies are not all installed"* ]]
+    dir="$FIXTURE/.claude/worktrees/98-theta"
+    [ -e "$(git -C "$dir" rev-parse --absolute-git-dir)/worktree-sail-install-dependencies" ]
+
+    run bash -c "cd '$dir' && ./bin/worktree-sail up"
+    [[ "$output" == *"installing Composer dependencies"* ]]
 }
 
 @test "a warm create is serving requests in under 60 seconds" {
