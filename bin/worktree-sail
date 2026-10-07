@@ -354,9 +354,9 @@ load_shared_services() {
     if ! out=$(cd "$MAIN_ROOT" \
             && WWWUSER="${WWWUSER:-$(id -u)}" WWWGROUP="${WWWGROUP:-$(id -g)}" \
                docker compose config --services 2>/dev/null); then
-        out=$(cd "$MAIN_ROOT" \
+        out=$({ cd "$MAIN_ROOT" \
             && WWWUSER="${WWWUSER:-$(id -u)}" WWWGROUP="${WWWGROUP:-$(id -g)}" \
-               docker compose config --services 2>&1 >/dev/null || true)
+               docker compose config --services 2>&1 >/dev/null; } || true)
         die "docker compose cannot read the Compose files in $MAIN_ROOT: $(printf '%s' "$out" | tail -n 1)"
     fi
     _SHARED_SERVICES=$(printf '%s\n' "$out" | grep -vxF "$APP_SERVICE" | sort | tr '\n' ' ' || true)
@@ -597,7 +597,7 @@ kv_database_claimed() { # <index>
     local other f
     while IFS= read -r other; do
         f="$other/.env"
-        [ -f "$f" ] && [ "$f" != "$ENV_FILE" ] || continue
+        if [ ! -f "$f" ] || [ "$f" = "$ENV_FILE" ]; then continue; fi
         if [ "$other" != "$MAIN_ROOT" ] && ! env_is_own "$other"; then continue; fi
         [ "$(kv_number "$(env_or "$f" REDIS_CACHE_DB 1)")" != "$1" ] || return 0
         [ "$(kv_number "$(env_or "$f" REDIS_DB 0)")" != "$1" ] || return 0
