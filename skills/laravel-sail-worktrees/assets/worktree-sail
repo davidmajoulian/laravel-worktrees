@@ -354,9 +354,9 @@ load_shared_services() {
     if ! out=$(cd "$MAIN_ROOT" \
             && WWWUSER="${WWWUSER:-$(id -u)}" WWWGROUP="${WWWGROUP:-$(id -g)}" \
                docker compose config --services 2>/dev/null); then
-        out=$(cd "$MAIN_ROOT" \
+        out=$({ cd "$MAIN_ROOT" \
             && WWWUSER="${WWWUSER:-$(id -u)}" WWWGROUP="${WWWGROUP:-$(id -g)}" \
-               docker compose config --services 2>&1 >/dev/null || true)
+               docker compose config --services 2>&1 >/dev/null; } || true)
         die "docker compose cannot read the Compose files in $MAIN_ROOT: $(printf '%s' "$out" | tail -n 1)"
     fi
     _SHARED_SERVICES=$(printf '%s\n' "$out" | grep -vxF "$APP_SERVICE" | sort | tr '\n' ' ' || true)
@@ -597,7 +597,7 @@ kv_database_claimed() { # <index>
     local other f
     while IFS= read -r other; do
         f="$other/.env"
-        [ -f "$f" ] && [ "$f" != "$ENV_FILE" ] || continue
+        if [ ! -f "$f" ] || [ "$f" = "$ENV_FILE" ]; then continue; fi
         if [ "$other" != "$MAIN_ROOT" ] && ! env_is_own "$other"; then continue; fi
         [ "$(kv_number "$(env_or "$f" REDIS_CACHE_DB 1)")" != "$1" ] || return 0
         [ "$(kv_number "$(env_or "$f" REDIS_DB 0)")" != "$1" ] || return 0
@@ -702,7 +702,9 @@ ensure_database() { # <project> <user> <database>
         info "DB_CONNECTION is '$driver'; no shared database server to prepare"
         return 0
     fi
-    valid_db_name "$2" && valid_db_name "$3" || die "refusing database '$3' / role '$2': use letters, digits, _ and -"
+    if ! valid_db_name "$2" || ! valid_db_name "$3"; then
+        die "refusing database '$3' / role '$2': use letters, digits, _ and -"
+    fi
     c=$(compose_container "$1" "$svc")
     [ -n "$c" ] || die "the shared '$svc' container is not running"
     pw=$(env_or "$MAIN_ENV" DB_PASSWORD password)
@@ -935,6 +937,7 @@ s3_run() { # <env file> <script>
 
 # A fresh S3 server answers its health check a moment before it accepts
 # requests, so the script waits for the API itself first.
+# shellcheck disable=SC2016 # The shell in the S3 client's container expands it.
 S3_READY='i=0; until aws s3api list-buckets >/dev/null 2>&1; do i=$((i+1)); [ $i -lt 30 ] || exit 1; sleep 1; done; '
 
 ensure_buckets() { # <env file>
@@ -1517,6 +1520,7 @@ teardown() { # <worktree path>
         candidates=$db
         # Older versions cut names at 55 characters without a hash.
         [ "$own" = 1 ] || candidates="$candidates $(printf '%s_%s' "$main_db" "$(worktree_slug "$path")" | cut -c1-55)"
+        # shellcheck disable=SC2086 # A list of names, split into one per line on purpose.
         for db in $(printf '%s\n' $candidates | awk '!seen[$0]++'); do
             [ "$db" != "$main_db" ] || continue
             tdb="${db}_testing"
@@ -1661,8 +1665,11 @@ cmd_remove() {
     # for. A branch only guessed from the name goes only when it is merged.
     if [ "$drop_branch" = "--branch" ] && [ -n "$branch" ]; then
         if [ "$registered" = no ]; then
-            git -C "$MAIN_ROOT" branch -d "$branch" >/dev/null 2>&1 && info "deleted branch $branch" \
-                || warn "kept branch $branch: it is not fully merged; delete it with git branch -D if it is done with"
+            if git -C "$MAIN_ROOT" branch -d "$branch" >/dev/null 2>&1; then
+                info "deleted branch $branch"
+            else
+                warn "kept branch $branch: it is not fully merged; delete it with git branch -D if it is done with"
+            fi
         else
             git -C "$MAIN_ROOT" branch -D "$branch" >/dev/null && info "deleted branch $branch"
         fi
